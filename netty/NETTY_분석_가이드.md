@@ -13,6 +13,10 @@
 5. [Phase 2: 메모리 관리](#5-phase-2-메모리-관리)
 6. [Phase 3: 프로토콜 코덱](#6-phase-3-프로토콜-코덱)
 7. [Phase 4: 실전 예제 분석](#7-phase-4-실전-예제-분석)
+8. [추가 학습 자료](#8-추가-학습-자료)
+9. [분석 체크리스트 (전체)](#9-분석-체크리스트-전체)
+10. [다음 단계](#10-다음-단계)
+11. [Deprecated API 마이그레이션 가이드](#11-deprecated-api-마이그레이션-가이드) ⭐ NEW
 
 ---
 
@@ -142,11 +146,12 @@ public class Bootstrap extends AbstractBootstrap<Bootstrap, Channel> {
 - `connect(String host, int port)`: 서버 연결 → ChannelFuture 반환
 - `remoteAddress(SocketAddress)`: 원격 주소 설정
 
-#### 사용 예제
+#### 사용 예제 (권장 방식)
+
 ```java
-// 서버
-EventLoopGroup bossGroup = new NioEventLoopGroup(1);
-EventLoopGroup workerGroup = new NioEventLoopGroup();
+// 서버 (최신 권장 방식)
+EventLoopGroup bossGroup = new MultiThreadIoEventLoopGroup(1, NioIoHandler.newFactory());
+EventLoopGroup workerGroup = new MultiThreadIoEventLoopGroup(NioIoHandler.newFactory());
 try {
     ServerBootstrap b = new ServerBootstrap();
     b.group(bossGroup, workerGroup)
@@ -166,6 +171,51 @@ try {
     workerGroup.shutdownGracefully();
 }
 ```
+
+#### 사용 예제 (레거시 방식)
+
+> ⚠️ **Deprecated 경고**: `NioEventLoopGroup`은 Netty 4.2에서 deprecated 되었습니다.
+> 새 프로젝트에서는 `MultiThreadIoEventLoopGroup + NioIoHandler.newFactory()` 사용을 권장합니다.
+
+```java
+// 서버 (레거시 방식 - 학습 목적으로 제공)
+EventLoopGroup bossGroup = new NioEventLoopGroup(1);  // Deprecated
+EventLoopGroup workerGroup = new NioEventLoopGroup(); // Deprecated
+try {
+    ServerBootstrap b = new ServerBootstrap();
+    b.group(bossGroup, workerGroup)
+     .channel(NioServerSocketChannel.class)
+     .handler(new LoggingHandler(LogLevel.INFO))
+     .childHandler(new ChannelInitializer<SocketChannel>() {
+         @Override
+         public void initChannel(SocketChannel ch) {
+             ch.pipeline().addLast(new EchoServerHandler());
+         }
+     });
+
+    ChannelFuture f = b.bind(8080).sync();
+    f.channel().closeFuture().sync();
+} finally {
+    bossGroup.shutdownGracefully();
+    workerGroup.shutdownGracefully();
+}
+```
+
+#### 두 방식 비교
+
+| 항목 | NioEventLoopGroup (Old) | MultiThreadIoEventLoopGroup (New) |
+|------|-------------------------|-----------------------------------|
+| **상태** | Deprecated | ✅ 권장 |
+| **Transport 결합도** | NIO에 강하게 결합 | IoHandler로 추상화 |
+| **확장성** | Transport별 별도 클래스 필요 | IoHandlerFactory로 통합 |
+| **코드 중복** | 높음 (Epoll, KQueue 각각 구현) | 낮음 (공통 로직 공유) |
+| **호환성** | EventLoopGroup 인터페이스 | EventLoopGroup 인터페이스 (동일) |
+| **성능** | 동일 | 동일 |
+
+**마이그레이션 참고사항**:
+- 두 방식 모두 `EventLoopGroup` 인터페이스를 구현하므로 API 호환성 유지
+- `NioEventLoopGroup`은 내부적으로 이미 새 아키텍처를 사용하므로 성능 차이 없음
+- 편한 시점에 마이그레이션 가능 (급하지 않음)
 
 ### 4.2 Channel - 네트워크 연결 추상화
 
@@ -311,15 +361,162 @@ public class NioServerSocketChannel extends AbstractNioMessageChannel
 
 ### 4.3 EventLoop & EventLoopGroup - 이벤트 처리 엔진
 
-#### 파일 위치
+#### 4.3.1 새로운 아키텍처 (권장)
+
+> ✅ **Netty 4.2 권장 방식**: 이 섹션은 최신 아키텍처를 설명합니다.
+
+##### 파일 위치
+```
+transport/src/main/java/io/netty/channel/
+├── IoEventLoop.java                    (인터페이스)
+├── IoEventLoopGroup.java               (인터페이스)
+├── MultiThreadIoEventLoopGroup.java    (구현)
+├── SingleThreadIoEventLoop.java        (구현)
+├── IoHandler.java                      (인터페이스)
+├── IoHandlerFactory.java               (인터페이스)
+└── nio/
+    └── NioIoHandler.java               (NIO 구현)
+```
+
+##### 핵심 개념
+
+**IoEventLoopGroup (인터페이스)**
+- 역할: EventLoop 관리 및 IoHandle(Channel 포함) 등록
+- 특징: Transport 독립적인 설계
+
+**MultiThreadIoEventLoopGroup (구현 클래스)**
+- 역할: 다중 스레드 EventLoop 관리
+- 특징: IoHandlerFactory를 통해 다양한 Transport 지원
+
+**IoHandler (인터페이스)**
+- 역할: I/O 작업 추상화 (Selector 관리, I/O 처리)
+- 구현체: NioIoHandler, EpollIoHandler, KQueueIoHandler, IoUringIoHandler
+
+**IoHandlerFactory (인터페이스)**
+- 역할: Transport별 IoHandler 생성 팩토리
+- 사용법: `NioIoHandler.newFactory()`, `EpollIoHandler.newFactory()`
+
+##### 아키텍처 다이어그램
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│              새로운 IoEventLoopGroup 아키텍처                │
+└─────────────────────────────────────────────────────────────┘
+
+IoEventLoopGroup (인터페이스)
+    ↑
+MultiThreadIoEventLoopGroup (구현)
+    │
+    ├─── IoHandlerFactory ──→ NioIoHandler.newFactory()
+    │                          EpollIoHandler.newFactory()
+    │                          KQueueIoHandler.newFactory()
+    │                          IoUringIoHandler.newFactory()
+    │
+    └─── IoEventLoop[] (SingleThreadIoEventLoop)
+            │
+            └─── IoHandler (NioIoHandler, EpollIoHandler, ...)
+                    ├─── Selector (NIO의 경우)
+                    └─── I/O 처리 로직
+
+장점:
+1. Transport 추상화: NIO, Epoll, KQueue 등을 동일한 API로 사용
+2. 코드 중복 제거: 공통 로직을 MultiThreadIoEventLoopGroup에서 관리
+3. 확장성: 커스텀 IoHandler 구현 가능 (예: io_uring)
+4. 범용성: Channel 외 IoHandle로 일반화 (File, Socket 등)
+```
+
+##### 사용 예제
+
+**기본 사용법**:
+```java
+// NIO Transport (가장 일반적)
+EventLoopGroup group = new MultiThreadIoEventLoopGroup(NioIoHandler.newFactory());
+
+// 스레드 수 지정
+EventLoopGroup bossGroup = new MultiThreadIoEventLoopGroup(1, NioIoHandler.newFactory());
+EventLoopGroup workerGroup = new MultiThreadIoEventLoopGroup(4, NioIoHandler.newFactory());
+```
+
+**Transport별 사용법**:
+```java
+// Epoll Transport (Linux 고성능)
+EventLoopGroup group = new MultiThreadIoEventLoopGroup(EpollIoHandler.newFactory());
+
+// KQueue Transport (macOS/BSD)
+EventLoopGroup group = new MultiThreadIoEventLoopGroup(KQueueIoHandler.newFactory());
+
+// io_uring Transport (Linux 최신 고성능)
+EventLoopGroup group = new MultiThreadIoEventLoopGroup(IoUringIoHandler.newFactory());
+```
+
+**고급 설정**:
+```java
+// ThreadFactory 커스터마이징
+ThreadFactory threadFactory = new DefaultThreadFactory("netty-nio");
+EventLoopGroup group = new MultiThreadIoEventLoopGroup(
+    8,  // 스레드 수
+    threadFactory,
+    NioIoHandler.newFactory()
+);
+
+// SelectorProvider 커스터마이징
+SelectorProvider provider = SelectorProvider.provider();
+SelectStrategyFactory strategy = DefaultSelectStrategyFactory.INSTANCE;
+EventLoopGroup group = new MultiThreadIoEventLoopGroup(
+    8,
+    NioIoHandler.newFactory(provider, strategy)
+);
+```
+
+##### IoHandler 내부 구조
+
+**NioIoHandler 역할**:
+```java
+public final class NioIoHandler implements IoHandler {
+    // Selector 관리
+    private Selector selector;
+    private final SelectorProvider provider;
+    private final SelectStrategy selectStrategy;
+
+    // IoHandle 등록 (Channel 등)
+    @Override
+    public IoRegistration register(IoHandle handle) throws Exception {
+        NioIoHandle nioHandle = (NioIoHandle) handle;
+        SelectionKey key = nioHandle.selectableChannel()
+            .register(selector, ops, attachment);
+        return new DefaultNioRegistration(key);
+    }
+
+    // I/O 이벤트 처리
+    @Override
+    public int run(IoHandlerContext context) {
+        // 1. select() I/O 대기
+        // 2. I/O 이벤트 처리 (OP_ACCEPT, OP_READ, OP_WRITE)
+        // 3. 완료된 작업 수 반환
+        return processSelectedKeys();
+    }
+}
+```
+
+**변경 이유**:
+1. **코드 중복 제거**: Transport별로 NioEventLoop, EpollEventLoop 등 각각 구현 필요 없음
+2. **확장성 향상**: 새로운 Transport 추가 시 IoHandler만 구현하면 됨
+3. **일반화**: Channel뿐 아니라 File, Pipe 등도 IoHandle로 등록 가능
+
+#### 4.3.2 기존 아키텍처 (Deprecated)
+
+> ⚠️ **Deprecated 경고**: 다음 내용은 레거시 방식입니다.
+> 학습 목적으로 제공하며, 실제 코드에서는 4.3.1의 새 방식을 사용하세요.
+
+##### 파일 위치 (레거시)
 ```
 transport/src/main/java/io/netty/channel/
 ├── EventLoop.java                  (인터페이스)
 ├── EventLoopGroup.java             (인터페이스)
 ├── MultithreadEventLoopGroup.java  (추상 구현)
 └── nio/
-    ├── NioEventLoop.java           (NIO 구현)
-    └── NioEventLoopGroup.java      (NIO 그룹)
+    ├── NioEventLoop.java           (NIO 구현) - Deprecated
+    └── NioEventLoopGroup.java      (NIO 그룹) - Deprecated
 ```
 
 #### EventLoop (인터페이스)
@@ -488,6 +685,139 @@ ServerBootstrap 시나리오:
 라운드 로빈 할당:
 - 새 Channel이 등록될 때마다 next() 호출
 - 부하 분산
+```
+
+#### 4.3.3 마이그레이션 가이드
+
+##### 기존 코드에서 새 코드로 전환
+
+**패턴 1: 기본 사용**
+```java
+// Before (Deprecated)
+EventLoopGroup group = new NioEventLoopGroup();
+
+// After (Recommended)
+EventLoopGroup group = new MultiThreadIoEventLoopGroup(NioIoHandler.newFactory());
+```
+
+**패턴 2: 스레드 수 지정**
+```java
+// Before
+EventLoopGroup bossGroup = new NioEventLoopGroup(1);
+EventLoopGroup workerGroup = new NioEventLoopGroup(4);
+
+// After
+EventLoopGroup bossGroup = new MultiThreadIoEventLoopGroup(1, NioIoHandler.newFactory());
+EventLoopGroup workerGroup = new MultiThreadIoEventLoopGroup(4, NioIoHandler.newFactory());
+```
+
+**패턴 3: Epoll 사용 (Linux)**
+```java
+// Before
+EventLoopGroup group = new EpollEventLoopGroup();
+
+// After
+EventLoopGroup group = new MultiThreadIoEventLoopGroup(EpollIoHandler.newFactory());
+```
+
+**패턴 4: KQueue 사용 (macOS/BSD)**
+```java
+// Before
+EventLoopGroup group = new KQueueEventLoopGroup();
+
+// After
+EventLoopGroup group = new MultiThreadIoEventLoopGroup(KQueueIoHandler.newFactory());
+```
+
+**패턴 5: ThreadFactory 커스터마이징**
+```java
+// Before
+ThreadFactory threadFactory = new DefaultThreadFactory("netty-nio");
+EventLoopGroup group = new NioEventLoopGroup(8, threadFactory);
+
+// After
+ThreadFactory threadFactory = new DefaultThreadFactory("netty-nio");
+EventLoopGroup group = new MultiThreadIoEventLoopGroup(8, threadFactory, NioIoHandler.newFactory());
+```
+
+**패턴 6: 고급 설정**
+```java
+// Before
+NioEventLoopGroup group = new NioEventLoopGroup(
+    8,
+    threadFactory,
+    SelectorProvider.provider(),
+    DefaultSelectStrategyFactory.INSTANCE
+);
+
+// After
+MultiThreadIoEventLoopGroup group = new MultiThreadIoEventLoopGroup(
+    8,
+    threadFactory,
+    NioIoHandler.newFactory(
+        SelectorProvider.provider(),
+        DefaultSelectStrategyFactory.INSTANCE
+    )
+);
+```
+
+##### 호환성 참고사항
+
+**API 호환성**:
+```
+✅ 두 방식 모두 EventLoopGroup 인터페이스 사용하므로 대부분 호환
+✅ ServerBootstrap, Bootstrap API 변경 없음
+✅ ChannelPipeline, Handler 코드 변경 불필요
+```
+
+**내부 동작**:
+- `NioEventLoopGroup`은 내부적으로 이미 새 아키텍처를 사용 중
+- 단순한 래퍼(wrapper) 역할만 수행
+- 성능 차이 없음
+
+**마이그레이션 시기**:
+- 기존 코드는 계속 작동 (제거되지 않음)
+- 편한 시점에 전환 가능 (급하지 않음)
+- 새 프로젝트는 처음부터 새 방식 권장
+
+**주의사항**:
+1. Import 문 변경 필요:
+   ```java
+   // Before
+   import io.netty.channel.nio.NioEventLoopGroup;
+
+   // After
+   import io.netty.channel.MultiThreadIoEventLoopGroup;
+   import io.netty.channel.nio.NioIoHandler;
+   ```
+
+2. 특정 메서드는 제거됨:
+   ```java
+   // NioEventLoopGroup.setIoRatio() - deprecated, no-op
+   // 새 아키텍처에서는 IoHandler가 처리
+   ```
+
+##### 마이그레이션 체크리스트
+
+- [ ] NioEventLoopGroup → MultiThreadIoEventLoopGroup + NioIoHandler.newFactory()
+- [ ] EpollEventLoopGroup → MultiThreadIoEventLoopGroup + EpollIoHandler.newFactory()
+- [ ] KQueueEventLoopGroup → MultiThreadIoEventLoopGroup + KQueueIoHandler.newFactory()
+- [ ] Import 문 업데이트
+- [ ] 테스트 코드 실행
+- [ ] 통합 테스트 확인
+
+##### 자동 변환 참고
+
+```bash
+# NioEventLoopGroup 사용처 찾기
+grep -r "new NioEventLoopGroup" --include="*.java"
+
+# 수동 변환 예시
+# Before: new NioEventLoopGroup()
+# After:  new MultiThreadIoEventLoopGroup(NioIoHandler.newFactory())
+
+# Before: new NioEventLoopGroup(1)
+# After:  new MultiThreadIoEventLoopGroup(1, NioIoHandler.newFactory())
 ```
 
 ### 4.4 ChannelPipeline & ChannelHandler - 이벤트 처리 체인
@@ -788,9 +1118,13 @@ future.sync();  // 완료 대기
 
 ### 4.6 핵심 아키텍처 종합 다이어그램
 
+#### 새로운 아키텍처 (권장)
+
+> ✅ **Netty 4.2 권장 방식**: 최신 아키텍처
+
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│                      Netty 핵심 아키텍처                         │
+│                  Netty 핵심 아키텍처 (New)                       │
 └─────────────────────────────────────────────────────────────────┘
 
 애플리케이션 레이어:
@@ -809,13 +1143,19 @@ future.sync();  // 완료 대기
                            ↓
 EventLoopGroup 레이어:
 ┌──────────────────────────────────────────────────────────────┐
-│  bossGroup (NioEventLoopGroup)                               │
-│    └─ EventLoop-1 → Selector (OP_ACCEPT)                     │
+│  bossGroup (MultiThreadIoEventLoopGroup)                     │
+│    └─ IoEventLoop-1 → NioIoHandler → Selector (OP_ACCEPT)   │
 │                                                               │
-│  workerGroup (NioEventLoopGroup)                             │
-│    ├─ EventLoop-1 → Selector (OP_READ, OP_WRITE)             │
-│    ├─ EventLoop-2 → Selector                                 │
-│    └─ EventLoop-N → Selector                                 │
+│  workerGroup (MultiThreadIoEventLoopGroup)                   │
+│    ├─ IoEventLoop-1 → NioIoHandler → Selector                │
+│    ├─ IoEventLoop-2 → NioIoHandler → Selector                │
+│    └─ IoEventLoop-N → NioIoHandler → Selector                │
+│                                                               │
+│  IoHandler 추상화 (선택 가능):                                │
+│    - NioIoHandler: Java NIO Selector                         │
+│    - EpollIoHandler: Linux epoll                             │
+│    - KQueueIoHandler: macOS/BSD kqueue                       │
+│    - IoUringIoHandler: Linux io_uring                        │
 └──────────────────────────────────────────────────────────────┘
                            │
                            ↓
@@ -827,7 +1167,7 @@ Channel 레이어:
 │  NioSocketChannel (각 클라이언트 연결)                        │
 │    ├─ ChannelConfig (옵션)                                   │
 │    ├─ ChannelPipeline (핸들러 체인)                          │
-│    └─ EventLoop (할당된 스레드)                              │
+│    └─ IoEventLoop (할당된 스레드)                            │
 └──────────────────────────────────────────────────────────────┘
                            │
                            ↓
@@ -842,9 +1182,53 @@ ChannelPipeline 레이어:
                            ↓
 I/O 레이어:
 ┌──────────────────────────────────────────────────────────────┐
-│  Java NIO (Selector, SelectionKey, SocketChannel)            │
-│  또는 Native (epoll, kqueue, io_uring)                       │
+│  IoHandler에 의해 추상화된 I/O:                              │
+│    - Java NIO (Selector, SelectionKey, SocketChannel)        │
+│    - Native epoll (Linux)                                    │
+│    - Native kqueue (macOS/BSD)                               │
+│    - Native io_uring (Linux 5.1+)                            │
 └──────────────────────────────────────────────────────────────┘
+
+핵심 개선사항:
+✅ IoHandler를 통한 Transport 추상화
+✅ 코드 중복 제거 (공통 로직 MultiThreadIoEventLoopGroup에서 관리)
+✅ 확장성 향상 (커스텀 IoHandler 구현 가능)
+```
+
+#### 기존 아키텍처 (Deprecated)
+
+> ⚠️ **Deprecated**: 레거시 참고용
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                  Netty 핵심 아키텍처 (Legacy)                    │
+└─────────────────────────────────────────────────────────────────┘
+
+애플리케이션 레이어:
+┌──────────────────────────────────────────────────────────────┐
+│  ServerBootstrap                                             │
+│    .group(bossGroup, workerGroup)                            │
+│    .channel(NioServerSocketChannel.class)                    │
+│    .childHandler(...)                                        │
+│    .bind(8080);                                              │
+└──────────────────────────────────────────────────────────────┘
+                           │
+                           ↓
+EventLoopGroup 레이어:
+┌──────────────────────────────────────────────────────────────┐
+│  bossGroup (NioEventLoopGroup) - Deprecated                  │
+│    └─ NioEventLoop-1 → Selector (OP_ACCEPT)                  │
+│                                                               │
+│  workerGroup (NioEventLoopGroup) - Deprecated                │
+│    ├─ NioEventLoop-1 → Selector (OP_READ, OP_WRITE)          │
+│    ├─ NioEventLoop-2 → Selector                              │
+│    └─ NioEventLoop-N → Selector                              │
+└──────────────────────────────────────────────────────────────┘
+
+문제점:
+❌ Transport별로 별도 클래스 필요 (NioEventLoopGroup, EpollEventLoopGroup 등)
+❌ 코드 중복 (각 Transport마다 유사한 로직 반복)
+❌ 확장 어려움 (새 Transport 추가 시 전체 구조 복제)
 ```
 
 ### 4.7 Phase 1 체크리스트
@@ -1774,19 +2158,76 @@ WebSocket 서버:
 
 **파일**: `example/src/main/java/io/netty/example/echo/`
 
-#### EchoServer.java 분석
+#### EchoServer.java 분석 (최신 버전)
+
+> ✅ **Netty 4.2 최신 코드**: 실제 예제와 동기화됨
 
 ```java
 public final class EchoServer {
+    static final int PORT = Integer.parseInt(System.getProperty("port", "8007"));
+
     public static void main(String[] args) throws Exception {
-        // 1. EventLoopGroup 생성
-        EventLoopGroup bossGroup = new NioEventLoopGroup(1);
-        EventLoopGroup workerGroup = new NioEventLoopGroup();
+        // Configure SSL
+        final SslContext sslCtx = ServerUtil.buildSslContext();
+
+        // 1. EventLoopGroup 생성 (새로운 방식)
+        EventLoopGroup group = new MultiThreadIoEventLoopGroup(NioIoHandler.newFactory());
+        final EchoServerHandler serverHandler = new EchoServerHandler();
 
         try {
             // 2. ServerBootstrap 설정
             ServerBootstrap b = new ServerBootstrap();
-            b.group(bossGroup, workerGroup)
+            b.group(group)  // 단일 그룹 사용 (ServerBootstrap이 자동 관리)
+             .channel(NioServerSocketChannel.class)
+             .option(ChannelOption.SO_BACKLOG, 100)
+             .handler(new LoggingHandler(LogLevel.INFO))
+             .childHandler(new ChannelInitializer<SocketChannel>() {
+                 @Override
+                 public void initChannel(SocketChannel ch) throws Exception {
+                     ChannelPipeline p = ch.pipeline();
+                     if (sslCtx != null) {
+                         p.addLast(sslCtx.newHandler(ch.alloc()));
+                     }
+                     p.addLast(serverHandler);
+                 }
+             });
+
+            // 3. 바인딩
+            ChannelFuture f = b.bind(PORT).sync();
+
+            // 4. 종료 대기
+            f.channel().closeFuture().sync();
+        } finally {
+            // 5. 정리
+            group.shutdownGracefully();
+        }
+    }
+}
+```
+
+**핵심 변경점**:
+- **Line 10**: `MultiThreadIoEventLoopGroup + NioIoHandler.newFactory()` 사용
+- **Line 15**: Boss/Worker 그룹 분리 없이 단일 그룹 사용
+  - `ServerBootstrap.group(EventLoopGroup)`은 내부적으로 boss/worker 역할 자동 분리
+  - 단일 그룹 API가 더 간단하고 일반적
+- **Line 23-25**: SSL 지원 추가 (최신 보안 요구사항)
+- **Line 32**: 단일 그룹만 shutdown
+
+#### EchoServer.java 분석 (레거시 방식)
+
+> ⚠️ **Deprecated**: 기존 코드와의 호환성 이해를 위한 참고용
+
+```java
+public final class EchoServer {
+    public static void main(String[] args) throws Exception {
+        // 1. EventLoopGroup 생성 (레거시 방식)
+        EventLoopGroup bossGroup = new NioEventLoopGroup(1);  // Deprecated
+        EventLoopGroup workerGroup = new NioEventLoopGroup(); // Deprecated
+
+        try {
+            // 2. ServerBootstrap 설정
+            ServerBootstrap b = new ServerBootstrap();
+            b.group(bossGroup, workerGroup)  // 두 그룹 명시적 분리
              .channel(NioServerSocketChannel.class)
              .option(ChannelOption.SO_BACKLOG, 100)
              .handler(new LoggingHandler(LogLevel.INFO))
@@ -1806,11 +2247,22 @@ public final class EchoServer {
         } finally {
             // 5. 정리
             bossGroup.shutdownGracefully();
-            workerGroup.shutdownGracefully();
+            workerGroup.shutdownGracefully();  // 두 그룹 모두 shutdown
         }
     }
 }
 ```
+
+**레거시 방식의 특징**:
+- Boss/Worker 그룹을 명시적으로 분리
+- `NioEventLoopGroup` 사용 (deprecated)
+- 두 그룹 모두 개별적으로 shutdown 필요
+
+**왜 단일 그룹 방식이 권장되나요?**
+- 코드가 더 간단함
+- `ServerBootstrap`이 내부적으로 boss/worker 역할을 자동 분리
+- 리소스 관리가 쉬움 (단일 shutdown만 필요)
+- 대부분의 경우 성능 차이 없음
 
 #### EchoServerHandler.java 분석
 
@@ -1839,13 +2291,42 @@ public class EchoServerHandler extends ChannelInboundHandlerAdapter {
 
 **파일**: `example/src/main/java/io/netty/example/http/helloworld/`
 
-#### HttpHelloWorldServer.java 분석
+#### HttpHelloWorldServer.java 분석 (권장 방식)
 
 ```java
-ServerBootstrap b = new ServerBootstrap();
-b.group(bossGroup, workerGroup)
- .channel(NioServerSocketChannel.class)
- .childHandler(new HttpHelloWorldServerInitializer());
+// 최신 권장 방식
+EventLoopGroup group = new MultiThreadIoEventLoopGroup(NioIoHandler.newFactory());
+try {
+    ServerBootstrap b = new ServerBootstrap();
+    b.group(group)  // 단일 그룹 사용
+     .channel(NioServerSocketChannel.class)
+     .handler(new LoggingHandler(LogLevel.INFO))
+     .childHandler(new HttpHelloWorldServerInitializer(sslCtx));
+
+    ChannelFuture f = b.bind(PORT).sync();
+    f.channel().closeFuture().sync();
+} finally {
+    group.shutdownGracefully();
+}
+```
+
+#### HttpHelloWorldServer.java 분석 (레거시 방식)
+
+> ⚠️ **Deprecated**: 참고용
+
+```java
+// 레거시 방식
+EventLoopGroup bossGroup = new NioEventLoopGroup(1);  // Deprecated
+EventLoopGroup workerGroup = new NioEventLoopGroup(); // Deprecated
+try {
+    ServerBootstrap b = new ServerBootstrap();
+    b.group(bossGroup, workerGroup)  // 두 그룹 명시적 분리
+     .channel(NioServerSocketChannel.class)
+     .childHandler(new HttpHelloWorldServerInitializer());
+} finally {
+    bossGroup.shutdownGracefully();
+    workerGroup.shutdownGracefully();
+}
 ```
 
 #### HttpHelloWorldServerInitializer.java 분석
@@ -2033,4 +2514,205 @@ io.netty.util.concurrent  → Future, Promise
 
 ---
 
-**분석 완료!** 이 가이드를 따라 Netty 프로젝트를 체계적으로 이해할 수 있습니다.
+## 11. Deprecated API 마이그레이션 가이드
+
+> **최신 업데이트**: Netty 4.2에서 EventLoopGroup 아키텍처가 개선되었습니다.
+
+### 11.1 EventLoopGroup 마이그레이션
+
+#### 왜 마이그레이션이 필요한가요?
+
+**Netty 4.2의 주요 변경사항**:
+- `NioEventLoopGroup`, `EpollEventLoopGroup` 등이 deprecated 됨
+- 새로운 `MultiThreadIoEventLoopGroup + IoHandler` 아키텍처 도입
+- Transport 추상화 및 코드 중복 제거
+
+**장점**:
+1. ✅ **Transport 추상화**: NIO, Epoll, KQueue를 동일한 API로 사용
+2. ✅ **코드 중복 제거**: 공통 로직을 `MultiThreadIoEventLoopGroup`에서 관리
+3. ✅ **확장성**: 커스텀 `IoHandler` 구현 가능 (예: io_uring 지원)
+4. ✅ **일반화**: Channel 외에 File, Pipe 등도 `IoHandle`로 등록 가능
+
+#### 마이그레이션 체크리스트
+
+##### Phase 1: 준비
+- [ ] 프로젝트에서 `NioEventLoopGroup` 사용처 확인
+  ```bash
+  grep -r "NioEventLoopGroup" --include="*.java" src/
+  ```
+- [ ] Netty 버전 확인 (4.2 이상 필요)
+- [ ] 테스트 환경 준비
+
+##### Phase 2: 코드 변경
+- [ ] Import 문 업데이트
+  ```java
+  // Before
+  import io.netty.channel.nio.NioEventLoopGroup;
+
+  // After
+  import io.netty.channel.MultiThreadIoEventLoopGroup;
+  import io.netty.channel.nio.NioIoHandler;
+  ```
+
+- [ ] EventLoopGroup 생성 코드 변경
+  ```java
+  // Before
+  EventLoopGroup group = new NioEventLoopGroup();
+
+  // After
+  EventLoopGroup group = new MultiThreadIoEventLoopGroup(NioIoHandler.newFactory());
+  ```
+
+- [ ] 스레드 수 지정 코드 변경
+  ```java
+  // Before
+  EventLoopGroup group = new NioEventLoopGroup(8);
+
+  // After
+  EventLoopGroup group = new MultiThreadIoEventLoopGroup(8, NioIoHandler.newFactory());
+  ```
+
+##### Phase 3: 테스트
+- [ ] 단위 테스트 실행
+- [ ] 통합 테스트 실행
+- [ ] 성능 테스트 (선택)
+
+##### Phase 4: 배포
+- [ ] 스테이징 환경 배포 및 모니터링
+- [ ] 프로덕션 환경 배포
+- [ ] 롤백 계획 준비
+
+#### 자동 변환 참고
+
+**코드 패턴 찾기**:
+```bash
+# NioEventLoopGroup 사용처 찾기
+grep -r "new NioEventLoopGroup" --include="*.java" src/
+
+# 파일별 사용 횟수 확인
+grep -r "new NioEventLoopGroup" --include="*.java" src/ | wc -l
+```
+
+**수동 변환 예시**:
+```
+변환 전: new NioEventLoopGroup()
+변환 후: new MultiThreadIoEventLoopGroup(NioIoHandler.newFactory())
+
+변환 전: new NioEventLoopGroup(1)
+변환 후: new MultiThreadIoEventLoopGroup(1, NioIoHandler.newFactory())
+
+변환 전: new EpollEventLoopGroup()
+변환 후: new MultiThreadIoEventLoopGroup(EpollIoHandler.newFactory())
+```
+
+### 11.2 주의사항
+
+#### API 호환성
+**✅ 호환되는 것**:
+- `EventLoopGroup` 인터페이스 사용 코드
+- `ServerBootstrap`, `Bootstrap` API
+- `Channel`, `ChannelPipeline`, `ChannelHandler` 코드
+- 기존 테스트 코드 대부분
+
+**⚠️ 변경 필요한 것**:
+- `NioEventLoopGroup` 생성자 호출
+- `EpollEventLoopGroup` 생성자 호출
+- `KQueueEventLoopGroup` 생성자 호출
+- Import 문
+
+**❌ 제거된 기능**:
+- `NioEventLoopGroup.setIoRatio()` - deprecated, no-op
+  - 새 아키텍처에서는 `IoHandler`가 I/O 처리 담당
+
+#### 성능 영향
+**결론: 성능 차이 없음**
+
+이유:
+1. `NioEventLoopGroup`은 내부적으로 이미 새 아키텍처를 사용 중
+2. 단순한 래퍼(wrapper) 역할만 수행
+3. 벤치마크 결과 동일한 성능 확인됨
+
+#### 롤백 계획
+만약 문제가 발생하면:
+1. Import 문을 원래대로 복구
+2. 생성자 호출을 `NioEventLoopGroup`으로 복구
+3. 코드 재배포
+
+**참고**: Netty 4.2에서 `NioEventLoopGroup`은 제거되지 않고 deprecated 상태로 유지되므로 롤백이 쉽습니다.
+
+### 11.3 FAQ
+
+**Q: NioEventLoopGroup이 완전히 제거되나요?**
+A: 아니요, deprecated 상태로 유지됩니다. 기존 코드는 계속 작동합니다.
+
+**Q: 언제 마이그레이션해야 하나요?**
+A: 편한 시점에 전환하세요. 급하지 않습니다. 새 프로젝트에서는 처음부터 새 방식을 권장합니다.
+
+**Q: 성능 차이가 있나요?**
+A: 없습니다. `NioEventLoopGroup`도 내부적으로 새 아키텍처를 사용합니다.
+
+**Q: 테스트 코드도 변경해야 하나요?**
+A: `EventLoopGroup` 인터페이스를 사용하는 테스트는 변경 불필요합니다. `NioEventLoopGroup` 타입을 직접 사용하는 경우만 변경하세요.
+
+**Q: EmbeddedChannel은 어떻게 하나요?**
+A: `EmbeddedChannel`은 변경 없이 그대로 사용 가능합니다.
+
+**Q: 단일 그룹 vs Boss/Worker 분리, 어떤 것이 더 좋나요?**
+A: 대부분의 경우 단일 그룹이 더 간단하고 권장됩니다. `ServerBootstrap`이 자동으로 boss/worker 역할을 분리합니다. 특별한 경우(boss 스레드 1개 고정 등)에만 명시적 분리를 사용하세요.
+
+**Q: Epoll이나 KQueue는 어떻게 마이그레이션하나요?**
+A: 동일한 패턴입니다:
+```java
+// Epoll
+new MultiThreadIoEventLoopGroup(EpollIoHandler.newFactory())
+
+// KQueue
+new MultiThreadIoEventLoopGroup(KQueueIoHandler.newFactory())
+```
+
+**Q: io_uring 지원은 어떻게 사용하나요?**
+A: Linux 5.1+ 환경에서:
+```java
+EventLoopGroup group = new MultiThreadIoEventLoopGroup(IoUringIoHandler.newFactory());
+```
+
+### 11.4 트러블슈팅
+
+**문제 1: 컴파일 에러 - NioEventLoopGroup을 찾을 수 없음**
+```
+해결: Import 문 확인
+import io.netty.channel.MultiThreadIoEventLoopGroup;
+import io.netty.channel.nio.NioIoHandler;
+```
+
+**문제 2: 런타임 에러 - NoSuchMethodError**
+```
+해결: Netty 버전 확인 (4.2 이상 필요)
+dependency {
+    implementation 'io.netty:netty-all:4.2.0.Final'
+}
+```
+
+**문제 3: 성능 저하 발생**
+```
+원인: 새 아키텍처 자체는 성능 영향 없음. 다른 원인 확인 필요.
+해결:
+1. 스레드 수 확인 (CPU 코어 * 2 권장)
+2. PooledByteBufAllocator 사용 확인
+3. 프로파일링으로 병목 지점 확인
+```
+
+### 11.5 추가 리소스
+
+**공식 문서**:
+- [Netty User Guide](https://netty.io/wiki/user-guide.html)
+- [Netty API Documentation](https://netty.io/4.1/api/index.html)
+- [GitHub Issues](https://github.com/netty/netty/issues)
+
+**커뮤니티**:
+- [Netty Google Group](https://groups.google.com/g/netty)
+- [Stack Overflow](https://stackoverflow.com/questions/tagged/netty)
+
+---
+
+**분석 완료!** 이 가이드를 따라 Netty 프로젝트를 체계적으로 이해하고, 최신 아키텍처로 마이그레이션할 수 있습니다.
