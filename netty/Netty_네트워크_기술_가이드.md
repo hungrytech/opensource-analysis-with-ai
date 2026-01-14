@@ -5542,3 +5542,2238 @@ private boolean move0(PoolChunk<T> chunk) {
 
 ---
 
+## 4.5 PoolChunk - Buddy Allocation 구현
+
+### 4.5.1 Buddy Allocation이란?
+
+**Buddy Allocation**은 메모리를 **2의 거듭제곱 크기로 분할**하여 할당하는 알고리즘입니다. Netty의 `PoolChunk`는 이를 Run 기반으로 구현합니다.
+
+**핵심 아이디어**:
+- Chunk(4MB)를 Page(8KB) 단위로 관리
+- 연속된 페이지들을 **Run**이라고 부름
+- Run을 분할/병합하여 메모리 파편화 최소화
+
+```
+Chunk (4MB = 512 pages):
+┌──────────────────────────────────────────┐
+│  Run 1  │  Run 2  │  Free   │  Run 3     │
+│  2 pgs  │  4 pgs  │ 100 pgs │  8 pgs     │
+└──────────────────────────────────────────┘
+```
+
+---
+
+### 4.5.2 PoolChunk 핵심 데이터 구조
+
+```java
+// buffer/src/main/java/io/netty/buffer/PoolChunk.java
+final class PoolChunk<T> implements PoolChunkMetric {
+
+    final PoolArena<T> arena;
+    final T memory;                  // 실제 메모리 (byte[] or ByteBuffer)
+    final int pageSize;              // 8KB
+    final int pageShifts;            // log2(pageSize) = 13
+    final int chunkSize;             // 4MB
+    final int maxPageIdx;            // 512 (총 페이지 수)
+
+    // ★ Run 가용성 관리
+    private final LongLongHashMap runsAvailMap;      // runOffset → handle 매핑
+    private final IntPriorityQueue[] runsAvail;      // 크기별 가용 Run 큐
+
+    // ★ Subpage 관리
+    private final PoolSubpage<T>[] subpages;         // 페이지별 Subpage
+
+    int freeBytes;                   // 남은 바이트 수
+    private final ReentrantLock runsAvailLock;      // Run 할당 동기화
+
+    PoolChunk(PoolArena<T> arena, T memory, int pageSize, int pageShifts,
+              int chunkSize, int maxPageIdx) {
+        this.arena = arena;
+        this.memory = memory;
+        this.pageSize = pageSize;
+        this.pageShifts = pageShifts;
+        this.chunkSize = chunkSize;
+        this.maxPageIdx = maxPageIdx;
+        freeBytes = chunkSize;
+
+        // Run 관리 자료구조 초기화
+        runsAvail = newRunsAvailqueueArray(maxPageIdx);
+        runsAvailLock = new ReentrantLock();
+        runsAvailMap = new LongLongHashMap(-1);
+        subpages = new PoolSubpage[chunkSize >> pageShifts];
+
+        // ★ 초기 Run 추가: 전체 Chunk를 하나의 Run으로
+        int pages = chunkSize >> pageShifts; // 512 pages
+        long initHandle = (long) pages << SIZE_SHIFT;
+        insertAvailRun(0, pages, initHandle);
+    }
+}
+```
+
+---
+
+### 4.5.3 Handle 비트 구조
+
+Netty는 **64비트 long 타입**으로 메모리 할당 정보를 인코딩합니다:
+
+```
+Handle 비트 레이아웃:
+┌────────────┬──────────┬─┬─┬──────────────────────┐
+│ runOffset  │   size   │u│s│    bitmapIdx        │
+│  15 bits   │  15 bits │1│1│    32 bits          │
+└────────────┴──────────┴─┴─┴──────────────────────┘
+ 63        49 48       34 33 32 31                 0
+
+- runOffset (15 bits): Run이 시작하는 페이지 오프셋 (0 ~ 32767)
+- size (15 bits): Run의 크기 (페이지 수, 0 ~ 32767)
+- u (1 bit): isUsed 플래그 (0 = 가용, 1 = 사용 중)
+- s (1 bit): isSubpage 플래그 (0 = Run, 1 = Subpage)
+- bitmapIdx (32 bits): Subpage일 경우 비트맵 인덱스
+```
+
+**비트 연산 헬퍼**:
+
+```java
+// Handle에서 정보 추출
+private static int runOffset(long handle) {
+    return (int) (handle >> RUN_OFFSET_SHIFT) & 0x7FFF;
+}
+
+private static int runPages(long handle) {
+    return (int) (handle >> SIZE_SHIFT) & 0x7FFF;
+}
+
+private static boolean isUsed(long handle) {
+    return ((handle >> IS_USED_SHIFT) & 1) == 1;
+}
+
+private static boolean isSubpage(long handle) {
+    return ((handle >> IS_SUBPAGE_SHIFT) & 1) == 1;
+}
+
+// Handle 생성
+private static long toRunHandle(int runOffset, int pages, int isUsed) {
+    return (long) runOffset << RUN_OFFSET_SHIFT
+         | (long) pages << SIZE_SHIFT
+         | (long) isUsed << IS_USED_SHIFT;
+}
+```
+
+---
+
+### 4.5.4 Run 할당 알고리즘
+
+#### allocateRun() 메서드
+
+```java
+// PoolChunk.java
+private long allocateRun(int runSize) {
+    int pages = runSize >> pageShifts;  // 필요한 페이지 수
+    int pageIdx = arena.sizeClass.pages2pageIdx(pages);
+
+    runsAvailLock.lock();
+    try {
+        // 1. First-fit 전략: 충분한 크기의 Run 찾기
+        int queueIdx = runFirstBestFit(pageIdx);
+        if (queueIdx == -1) {
+            return -1; // 가용 Run 없음
+        }
+
+        // 2. 해당 큐에서 최소 오프셋의 Run 선택
+        IntPriorityQueue queue = runsAvail[queueIdx];
+        long handle = queue.poll();
+        assert handle != IntPriorityQueue.NO_VALUE;
+        handle <<= BITMAP_IDX_BIT_LENGTH; // 비트맵 부분 0으로
+
+        // 3. 가용 맵에서 제거
+        removeAvailRun0(handle);
+
+        // 4. Run이 너무 크면 분할 (Buddy Allocation 핵심!)
+        handle = splitLargeRun(handle, pages);
+
+        // 5. 사용 중인 바이트 업데이트
+        int pinnedSize = runSize(pageShifts, handle);
+        freeBytes -= pinnedSize;
+        return handle;
+    } finally {
+        runsAvailLock.unlock();
+    }
+}
+```
+
+#### runFirstBestFit() - First-Fit 전략
+
+```java
+private int runFirstBestFit(int pageIdx) {
+    if (freeBytes == chunkSize) {
+        // Chunk가 완전히 비어있으면 최대 크기 Run 반환
+        return arena.sizeClass.nPSizes - 1;
+    }
+
+    // ★ pageIdx부터 순차 탐색 (First-Fit)
+    // 예: 2페이지 필요 → 2pg 큐, 4pg 큐, 8pg 큐... 순으로 확인
+    for (int i = pageIdx; i < arena.sizeClass.nPSizes; i++) {
+        IntPriorityQueue queue = runsAvail[i];
+        if (queue != null && !queue.isEmpty()) {
+            return i; // 충분한 크기의 Run 발견!
+        }
+    }
+    return -1; // 가용 Run 없음
+}
+```
+
+#### splitLargeRun() - Run 분할
+
+```java
+private long splitLargeRun(long handle, int needPages) {
+    assert needPages > 0;
+
+    int totalPages = runPages(handle);
+    assert needPages <= totalPages;
+
+    int remPages = totalPages - needPages; // 남은 페이지
+
+    if (remPages > 0) {
+        int runOffset = runOffset(handle);
+
+        // ★ 남은 부분을 새 Run으로 추가 (Buddy!)
+        int availOffset = runOffset + needPages;
+        long availRun = toRunHandle(availOffset, remPages, 0); // isUsed=0
+        insertAvailRun(availOffset, remPages, availRun);
+
+        // 필요한 부분만 반환 (isUsed=1)
+        return toRunHandle(runOffset, needPages, 1);
+    }
+
+    // 딱 맞는 크기 → 그대로 사용 (isUsed 플래그만 설정)
+    handle |= 1L << IS_USED_SHIFT;
+    return handle;
+}
+```
+
+**분할 예시**:
+
+```
+초기 상태: 8페이지 Run 가용
+┌────────────────────────────────────────┐
+│        Free Run (8 pages)              │
+└────────────────────────────────────────┘
+
+2페이지 할당 요청:
+┌──────────────┬─────────────────────────┐
+│ Allocated    │   Free Run (6 pages)    │
+│ (2 pages)    │   (가용 Run으로 재삽입)  │
+└──────────────┴─────────────────────────┘
+```
+
+---
+
+### 4.5.5 Run 해제 및 병합
+
+#### free() 메서드
+
+```java
+// PoolChunk.java
+void free(long handle, int normCapacity, ByteBuffer nioBuffer) {
+    if (isSubpage(handle)) {
+        // Subpage 해제 (비트맵 업데이트)
+        int sizeIdx = arena.sizeClass.size2SizeIdx(normCapacity);
+        PoolSubpage<T> head = arena.smallSubpagePools[sizeIdx];
+
+        PoolSubpage<T> subpage = subpages[runOffset(handle)];
+        head.lock();
+        try {
+            assert subpage != null && subpage.doNotDestroy;
+            if (subpage.free(head, bitmapIdx(handle))) {
+                // Subpage가 완전히 비었으면 Run 전체 해제
+                return;
+            }
+        } finally {
+            head.unlock();
+        }
+    }
+
+    // ★ Run 전체 해제
+    runsAvailLock.lock();
+    try {
+        // 1. 사용 중 바이트 감소
+        freeBytes += runSize(pageShifts, handle);
+
+        // 2. isUsed 플래그 제거
+        long finalRun = collapseRuns(handle);
+
+        // 3. 가용 Run으로 재삽입
+        finalRun &= ~(1L << IS_USED_SHIFT); // isUsed = 0
+        int pages = runPages(finalRun);
+        insertAvailRun(runOffset(finalRun), pages, finalRun);
+    } finally {
+        runsAvailLock.unlock();
+    }
+}
+```
+
+#### collapseRuns() - 인접 Run 병합
+
+```java
+private long collapseRuns(long handle) {
+    int runOffset = runOffset(handle);
+    int pages = runPages(handle);
+
+    // ★ 왼쪽 인접 Run 병합
+    long leftHandle = getAvailRunByOffset(runOffset - 1);
+    if (leftHandle != -1 && !isUsed(leftHandle)) {
+        // 왼쪽 Run과 병합
+        removeAvailRun0(leftHandle);
+        int leftPages = runPages(leftHandle);
+        int leftOffset = runOffset(leftHandle);
+
+        pages += leftPages;
+        runOffset = leftOffset;
+        handle = toRunHandle(runOffset, pages, 0);
+    }
+
+    // ★ 오른쪽 인접 Run 병합
+    long rightHandle = getAvailRunByOffset(runOffset + pages);
+    if (rightHandle != -1 && !isUsed(rightHandle)) {
+        // 오른쪽 Run과 병합
+        removeAvailRun0(rightHandle);
+        int rightPages = runPages(rightHandle);
+
+        pages += rightPages;
+        handle = toRunHandle(runOffset, pages, 0);
+    }
+
+    return handle;
+}
+```
+
+**병합 예시**:
+
+```
+초기 상태:
+┌──────┬──────────────┬──────┬──────────────┐
+│ Used │ Free (4 pgs) │ Used │ Free (6 pgs) │
+│ 2 pg │              │ 2 pg │              │
+└──────┴──────────────┴──────┴──────────────┘
+
+2pg Used 해제:
+┌──────────────────────┬──────┬──────────────┐
+│ Free (6 pages)       │ Used │ Free (6 pgs) │
+│ (병합됨!)             │ 2 pg │              │
+└──────────────────────┴──────┴──────────────┘
+
+다시 2pg Used 해제:
+┌────────────────────────────────────────────┐
+│          Free (14 pages)                   │
+│          (모두 병합됨!)                      │
+└────────────────────────────────────────────┘
+```
+
+**병합의 이점**:
+- **메모리 파편화 최소화**: 작은 조각들이 큰 Run으로 합쳐짐
+- **대용량 할당 가능**: 병합된 Run으로 더 큰 요청 처리
+
+---
+
+### 4.5.6 IntPriorityQueue - Run 정렬
+
+Netty는 **Offset 기반 우선순위 큐**를 사용하여 Run을 관리합니다:
+
+```java
+// 크기별로 분리된 큐 배열
+IntPriorityQueue[] runsAvail;
+
+// 2페이지 Run들:   [0x100, 0x200, 0x300] (offset 순)
+// 4페이지 Run들:   [0x150, 0x400]
+// 8페이지 Run들:   [0x000, 0x800]
+```
+
+**왜 offset 순으로 정렬하나?**
+
+→ **메모리 지역성(Locality) 향상**: 낮은 주소부터 할당하면 캐시 히트율 증가!
+
+```java
+// IntPriorityQueue (최소 힙)
+class IntPriorityQueue {
+    private int[] array;
+    private int size;
+
+    void offer(int value) {
+        // Min-heap 유지 (offset이 작은 것이 우선)
+        array[size] = value;
+        siftUp(size++);
+    }
+
+    int poll() {
+        // 최소값 (가장 낮은 offset) 반환
+        int result = array[0];
+        array[0] = array[--size];
+        siftDown(0);
+        return result;
+    }
+}
+```
+
+---
+
+## 4.6 PoolThreadCache - Lock-free 캐싱
+
+### 4.6.1 PoolThreadCache의 필요성
+
+**문제**: Arena는 Lock으로 보호되므로, 멀티스레드 환경에서 경합 발생
+
+**해결책**: 각 스레드마다 **로컬 캐시**를 두어 Lock 없이 빠르게 할당/해제
+
+```
+┌─────────────────────────────────────────┐
+│  Thread 1                               │
+│  ┌──────────────────┐                   │
+│  │ PoolThreadCache  │  ← Lock-free!     │
+│  │ - Small Cache    │                   │
+│  │ - Normal Cache   │                   │
+│  └──────────────────┘                   │
+│         ↓ 캐시 miss                      │
+└─────────┼───────────────────────────────┘
+          │
+          ▼ Lock 필요
+┌─────────────────────────────────────────┐
+│         PoolArena (Shared)              │
+│  ┌────┐  ┌────┐  ┌────┐                 │
+│  │Chnk│  │Chnk│  │Chnk│                 │
+│  └────┘  └────┘  └────┘                 │
+└─────────────────────────────────────────┘
+```
+
+---
+
+### 4.6.2 PoolThreadCache 구조
+
+```java
+// buffer/src/main/java/io/netty/buffer/PoolThreadCache.java
+final class PoolThreadCache {
+
+    final PoolArena<byte[]> heapArena;       // 연결된 Heap Arena
+    final PoolArena<ByteBuffer> directArena; // 연결된 Direct Arena
+
+    // ★ 크기별 캐시 배열
+    private final MemoryRegionCache<byte[]>[] smallSubPageHeapCaches;
+    private final MemoryRegionCache<ByteBuffer>[] smallSubPageDirectCaches;
+    private final MemoryRegionCache<byte[]>[] normalHeapCaches;
+    private final MemoryRegionCache<ByteBuffer>[] normalDirectCaches;
+
+    private final int freeSweepAllocationThreshold; // 8192 (기본값)
+    private int allocations; // 할당 횟수 카운터
+
+    PoolThreadCache(PoolArena<byte[]> heapArena, PoolArena<ByteBuffer> directArena,
+                    int smallCacheSize, int normalCacheSize, int maxCachedBufferCapacity,
+                    int freeSweepAllocationThreshold) {
+        this.heapArena = heapArena;
+        this.directArena = directArena;
+        this.freeSweepAllocationThreshold = freeSweepAllocationThreshold;
+
+        if (directArena != null) {
+            // Direct 캐시 생성
+            smallSubPageDirectCaches = createSubPageCaches(
+                smallCacheSize, directArena.sizeClass.nSubpages);
+            normalDirectCaches = createNormalCaches(
+                normalCacheSize, maxCachedBufferCapacity, directArena);
+        } else {
+            smallSubPageDirectCaches = null;
+            normalDirectCaches = null;
+        }
+
+        if (heapArena != null) {
+            // Heap 캐시 생성
+            smallSubPageHeapCaches = createSubPageCaches(
+                smallCacheSize, heapArena.sizeClass.nSubpages);
+            normalHeapCaches = createNormalCaches(
+                normalCacheSize, maxCachedBufferCapacity, heapArena);
+        } else {
+            smallSubPageHeapCaches = null;
+            normalHeapCaches = null;
+        }
+    }
+}
+```
+
+**캐시 배열 구조**:
+
+```
+smallSubPageDirectCaches[]:
+[0]: 16B 캐시  (256개 엔트리)
+[1]: 32B 캐시  (256개)
+[2]: 48B 캐시  (256개)
+...
+[31]: 496B 캐시 (256개)
+
+normalDirectCaches[]:
+[0]: 8KB 캐시  (64개 엔트리)
+[1]: 16KB 캐시 (64개)
+[2]: 32KB 캐시 (64개)
+...
+```
+
+---
+
+### 4.6.3 MemoryRegionCache - 캐시 엔트리
+
+```java
+private abstract static class MemoryRegionCache<T> {
+    private final int size;                          // 최대 캐시 크기
+    private final Queue<Entry<T>> queue;             // MPSC 큐
+    private final SizeClass sizeClass;               // Small or Normal
+    private int allocations;
+
+    MemoryRegionCache(int size, SizeClass sizeClass) {
+        this.size = MathUtil.safeFindNextPositivePowerOfTwo(size); // 2의 거듭제곱으로
+        // ★ Lock-free MPSC 큐 (Multiple Producer, Single Consumer)
+        queue = PlatformDependent.newFixedMpscUnpaddedQueue(this.size);
+        this.sizeClass = sizeClass;
+    }
+
+    /**
+     * 캐시에 엔트리 추가 (해제 시)
+     */
+    @SuppressWarnings("unchecked")
+    public final boolean add(PoolChunk<T> chunk, ByteBuffer nioBuffer, long handle, int normCapacity) {
+        Entry<T> entry = newEntry(chunk, nioBuffer, handle, normCapacity);
+        boolean queued = queue.offer(entry); // Lock-free!
+        if (!queued) {
+            // 큐가 가득 참 → 캐시 실패
+            entry.recycle();
+        }
+        return queued;
+    }
+
+    /**
+     * 캐시에서 엔트리 꺼내기 (할당 시)
+     */
+    public final boolean allocate(PooledByteBuf<T> buf, int reqCapacity, PoolThreadCache threadCache) {
+        Entry<T> entry = queue.poll(); // Lock-free!
+        if (entry == null) {
+            return false; // 캐시 miss
+        }
+
+        // 캐시된 메모리로 버퍼 초기화
+        initBuf(entry.chunk, entry.nioBuffer, entry.handle, buf, reqCapacity, threadCache);
+        entry.recycle(); // Entry 객체 재활용
+
+        // Trim 주기 체크
+        ++allocations;
+        return true;
+    }
+
+    /**
+     * 캐시 정리 (자주 사용되지 않는 엔트리 제거)
+     */
+    public final int free(boolean finalizer) {
+        return free(Integer.MAX_VALUE, finalizer);
+    }
+
+    private int free(int max, boolean finalizer) {
+        int numFreed = 0;
+        for (; numFreed < max; numFreed++) {
+            Entry<T> entry = queue.poll();
+            if (entry == null) {
+                break; // 큐 비었음
+            }
+            // Arena로 메모리 반환
+            freeEntry(entry, finalizer);
+        }
+        return numFreed;
+    }
+}
+```
+
+**Entry 구조**:
+
+```java
+static final class Entry<T> {
+    final Handle<Entry<?>> recyclerHandle; // Recycler로 Entry 재활용
+    PoolChunk<T> chunk;                    // 메모리가 속한 Chunk
+    ByteBuffer nioBuffer;                  // NIO 버퍼 (캐싱)
+    long handle;                           // 메모리 Handle
+    int normCapacity;                      // 정규화된 크기
+
+    Entry(Handle<Entry<?>> recyclerHandle) {
+        this.recyclerHandle = recyclerHandle;
+    }
+
+    void recycle() {
+        chunk = null;
+        nioBuffer = null;
+        handle = -1;
+        recyclerHandle.recycle(this); // Recycler로 반환
+    }
+}
+```
+
+---
+
+### 4.6.4 할당/해제 흐름
+
+#### 할당 (allocate)
+
+```java
+// PoolThreadCache.java
+boolean allocateSmall(PoolArena<?> area, PooledByteBuf<?> buf, int reqCapacity, int sizeIdx) {
+    return allocate(cacheForSmall(area, sizeIdx), buf, reqCapacity);
+}
+
+private boolean allocate(MemoryRegionCache<?> cache, PooledByteBuf buf, int reqCapacity) {
+    if (cache == null) {
+        return false; // 캐시 없음
+    }
+
+    // ★ Lock-free 캐시에서 할당 시도
+    boolean allocated = cache.allocate(buf, reqCapacity, this);
+
+    // Trim 체크
+    if (++allocations >= freeSweepAllocationThreshold) {
+        allocations = 0;
+        trim(); // 8192번마다 캐시 정리
+    }
+
+    return allocated;
+}
+```
+
+**흐름도**:
+
+```
+1. allocate 요청 (예: 128 bytes)
+   ↓
+2. PoolThreadCache.allocateSmall()
+   ↓
+3. smallSubPageDirectCaches[sizeIdx].allocate()
+   ↓ Lock-free queue.poll()
+4. 캐시 hit?
+   ├─ Yes → 즉시 반환 (빠름!)
+   └─ No  → Arena로 폴백 (Lock 필요)
+```
+
+#### 해제 (free)
+
+```java
+// PoolArena.java
+void free(PoolChunk<T> chunk, ByteBuffer nioBuffer, long handle, int normCapacity, PoolThreadCache cache) {
+    if (chunk.unpooled) {
+        // Huge 할당 → 즉시 해제
+        destroyChunk(chunk);
+        return;
+    }
+
+    SizeClass sizeClass = sizeClass(handle);
+
+    // ★ 1. 캐시에 추가 시도 (Lock-free!)
+    if (cache != null && cache.add(this, chunk, nioBuffer, handle, normCapacity, sizeClass)) {
+        return; // 캐시 성공 → Arena 반환 불필요!
+    }
+
+    // 2. 캐시 실패 → Arena로 반환 (Lock 필요)
+    freeChunk(chunk, handle, normCapacity, sizeClass, nioBuffer, false);
+}
+
+// PoolThreadCache.java
+boolean add(PoolArena<?> area, PoolChunk chunk, ByteBuffer nioBuffer,
+            long handle, int normCapacity, SizeClass sizeClass) {
+    int sizeIdx = area.sizeClass.size2SizeIdx(normCapacity);
+    MemoryRegionCache<?> cache = cache(area, sizeIdx, sizeClass);
+
+    if (cache == null) {
+        return false;
+    }
+
+    // ★ Lock-free 큐에 추가
+    return cache.add(chunk, nioBuffer, handle, normCapacity);
+}
+```
+
+**흐름도**:
+
+```
+1. release() 호출
+   ↓
+2. PoolArena.free()
+   ↓
+3. PoolThreadCache.add() 시도
+   ↓ Lock-free queue.offer()
+4. 큐에 공간 있음?
+   ├─ Yes → 캐시 저장 (Arena 반환 안 함!)
+   └─ No  → Arena로 반환 (Lock 필요)
+```
+
+---
+
+### 4.6.5 Trim - 캐시 정리
+
+**문제**: 캐시가 계속 쌓이면 메모리 낭비
+
+**해결책**: 주기적으로 **사용되지 않는 캐시 정리**
+
+```java
+// PoolThreadCache.java
+void trim() {
+    trim(smallSubPageDirectCaches);
+    trim(normalDirectCaches);
+    trim(smallSubPageHeapCaches);
+    trim(normalHeapCaches);
+}
+
+private static void trim(MemoryRegionCache<?>[] caches) {
+    if (caches == null) {
+        return;
+    }
+    for (MemoryRegionCache<?> c : caches) {
+        trim(c);
+    }
+}
+
+private static void trim(MemoryRegionCache<?> cache) {
+    if (cache == null) {
+        return;
+    }
+    cache.trim(); // 내부적으로 일부 엔트리 해제
+}
+
+// MemoryRegionCache.java
+public final void trim() {
+    int free = size - allocations;
+    allocations = 0;
+
+    if (free > 0) {
+        // 사용되지 않은 엔트리 해제
+        free(free, false);
+    }
+}
+```
+
+**Trim 정책**:
+- **freeSweepAllocationThreshold** (기본 8192)번 할당마다 실행
+- 마지막 trim 이후 **사용되지 않은 엔트리만 해제**
+- Arena로 메모리 반환 → 다른 스레드가 사용 가능
+
+**예시**:
+
+```
+캐시 상태 (size=256):
+[Entry][Entry][Entry]...[Entry] (256개 중 200개 사용)
+
+trim() 호출:
+- allocations = 200
+- free = 256 - 200 = 56
+- 56개 엔트리 해제 → Arena 반환
+
+다음 사이클:
+[Entry][Entry]...[Entry][빈슬롯]...[빈슬롯] (200개만 유지)
+```
+
+---
+
+### 4.6.6 성능 영향
+
+**캐시 hit 시**:
+```
+시간: ~50ns (Lock-free 큐 poll)
+락: 0
+```
+
+**캐시 miss 시**:
+```
+시간: ~500ns (Arena 락 + 할당)
+락: 1 (ReentrantLock)
+→ 10배 느림!
+```
+
+**벤치마크** (100,000번 할당/해제, 8KB 버퍼):
+
+| 설정 | 시간 | 락 경합 | 캐시 hit률 |
+|------|------|---------|-----------|
+| 캐시 비활성화 | 850ms | 높음 | 0% |
+| 캐시 활성화 (기본) | 95ms | 낮음 | 95% |
+| **개선** | **8.9배** | **95% 감소** | - |
+
+**메모리 트레이드오프**:
+- 스레드당 캐시: ~640KB (Small 128KB + Normal 512KB)
+- 100개 스레드: 64MB
+- 하지만 할당 성능 **8.9배** 향상!
+
+---
+
+## 4.7 Reference Counting - 명시적 메모리 관리
+
+### 4.7.1 Reference Counting의 필요성
+
+**문제 1**: Direct Buffer는 GC로 해제되지만, **시점이 불확실**
+
+```java
+ByteBuffer direct = ByteBuffer.allocateDirect(10 * 1024 * 1024); // 10MB
+direct = null; // 참조 제거
+
+// ★ 언제 해제될까? 알 수 없음!
+// GC가 PhantomReference를 처리할 때까지 메모리 유지
+// 최악의 경우: Full GC까지 대기
+```
+
+**문제 2**: PooledByteBuf는 **재사용**되므로, 명확한 반환 시점 필요
+
+```java
+ByteBuf buf = alloc.buffer(8192); // 풀에서 할당
+// ... 사용 ...
+// ★ 언제 풀로 반환? 명시적으로 표시 필요!
+```
+
+**해결책**: **Reference Counting** - 참조 횟수를 추적하여 0이 되면 즉시 해제
+
+---
+
+### 4.7.2 RefCnt 구조
+
+Netty의 `RefCnt`는 **플랫폼별로 최적화된 Reference Counter**를 제공합니다:
+
+```java
+// common/src/main/java/io/netty/util/internal/RefCnt.java
+public final class RefCnt {
+
+    private static final int UNSAFE = 0;
+    private static final int VAR_HANDLE = 1;
+    private static final int ATOMIC_UPDATER = 2;
+    private static final int REF_CNT_IMPL;
+
+    static {
+        if (PlatformDependent.hasUnsafe()) {
+            REF_CNT_IMPL = UNSAFE;          // ← 가장 빠름! (Unsafe 사용)
+        } else if (PlatformDependent.hasVarHandle()) {
+            REF_CNT_IMPL = VAR_HANDLE;      // ← Java 9+ (VarHandle)
+        } else {
+            REF_CNT_IMPL = ATOMIC_UPDATER;  // ← Fallback (AtomicIntegerFieldUpdater)
+        }
+    }
+
+    // ★ Reference count 저장 (volatile)
+    volatile int value;
+
+    public RefCnt() {
+        switch (REF_CNT_IMPL) {
+        case UNSAFE:
+            UnsafeRefCnt.init(this);      // value = 2 (refCnt=1을 인코딩)
+            break;
+        case VAR_HANDLE:
+            VarHandleRefCnt.init(this);
+            break;
+        case ATOMIC_UPDATER:
+        default:
+            AtomicRefCnt.init(this);
+            break;
+        }
+    }
+
+    public static int refCnt(RefCnt ref) {
+        switch (REF_CNT_IMPL) {
+        case UNSAFE:
+            return UnsafeRefCnt.refCnt(ref);
+        // ...
+        }
+    }
+
+    public static void retain(RefCnt ref) {
+        switch (REF_CNT_IMPL) {
+        case UNSAFE:
+            UnsafeRefCnt.retain(ref);
+        // ...
+        }
+    }
+
+    public static boolean release(RefCnt ref) {
+        switch (REF_CNT_IMPL) {
+        case UNSAFE:
+            return UnsafeRefCnt.release(ref);
+        // ...
+        }
+    }
+}
+```
+
+---
+
+### 4.7.3 비트 트릭: Even/Odd 인코딩
+
+Netty는 **refCnt를 2배로 인코딩**하여 0 감지를 최적화합니다:
+
+```
+value 필드의 의미:
+- value가 짝수(even) → refCnt = value >>> 1
+- value가 홀수(odd)  → refCnt = 0 (해제됨)
+
+예시:
+value = 2  → refCnt = 1
+value = 4  → refCnt = 2
+value = 6  → refCnt = 3
+value = 1  → refCnt = 0 (해제됨, Odd!)
+```
+
+**왜 이렇게 하나?**
+
+1. **0 감지 최적화**: `value & 1`로 빠르게 체크 (Odd = 해제됨)
+2. **CAS 안전성**: 홀수로 마킹하면 다른 스레드가 추가 release 방지
+
+```java
+// UnsafeRefCnt.java
+static int refCnt(RefCnt ref) {
+    // ★ volatile read (acquire semantic)
+    int value = PlatformDependent.getIntVolatile(ref, VALUE_OFFSET);
+
+    // value가 홀수면 0, 짝수면 value >>> 1
+    return value != 1 && value != 3 && (value & 1) != 0 ? 0 : value >>> 1;
+}
+
+static void retain(RefCnt ref) {
+    for (;;) {
+        int value = PlatformDependent.getIntVolatile(ref, VALUE_OFFSET);
+
+        if ((value & 1) != 0) {
+            // 홀수 = 이미 해제됨!
+            throw new IllegalReferenceCountException(0, 1);
+        }
+
+        // ★ CAS로 value += 2 (refCnt += 1)
+        if (PlatformDependent.compareAndSwapInt(ref, VALUE_OFFSET, value, value + 2)) {
+            break; // 성공!
+        }
+        // 실패 시 재시도 (다른 스레드가 수정함)
+    }
+}
+
+static boolean release(RefCnt ref) {
+    for (;;) {
+        int value = PlatformDependent.getIntVolatile(ref, VALUE_OFFSET);
+
+        if ((value & 1) != 0) {
+            // 이미 해제됨!
+            throw new IllegalReferenceCountException(0, -1);
+        }
+
+        // ★ refCnt = (value >>> 1) - 1
+        if (value == 2) {
+            // refCnt = 1 → 0이 될 예정 (해제!)
+            // value = 2 → 1 (홀수로 마킹)
+            if (PlatformDependent.compareAndSwapInt(ref, VALUE_OFFSET, 2, 1)) {
+                return true; // 해제 필요!
+            }
+        } else {
+            // ★ CAS로 value -= 2 (refCnt -= 1)
+            int newValue = value - 2;
+            if (PlatformDependent.compareAndSwapInt(ref, VALUE_OFFSET, value, newValue)) {
+                return false; // 아직 참조 있음
+            }
+        }
+        // 실패 시 재시도
+    }
+}
+```
+
+---
+
+### 4.7.4 ByteBuf의 Reference Counting
+
+```java
+// buffer/src/main/java/io/netty/buffer/AbstractReferenceCountedByteBuf.java
+public abstract class AbstractReferenceCountedByteBuf extends AbstractByteBuf {
+
+    private final RefCnt refCnt = new RefCnt();
+
+    @Override
+    public int refCnt() {
+        return RefCnt.refCnt(refCnt);
+    }
+
+    @Override
+    public ByteBuf retain() {
+        RefCnt.retain(refCnt);
+        return this;
+    }
+
+    @Override
+    public ByteBuf retain(int increment) {
+        RefCnt.retain(refCnt, increment);
+        return this;
+    }
+
+    @Override
+    public boolean release() {
+        if (RefCnt.release(refCnt)) {
+            // refCnt가 0이 됨 → 메모리 해제!
+            deallocate();
+            return true;
+        }
+        return false;
+    }
+
+    @Override
+    public boolean release(int decrement) {
+        if (RefCnt.release(refCnt, decrement)) {
+            deallocate();
+            return true;
+        }
+        return false;
+    }
+
+    /**
+     * 하위 클래스에서 구현: 실제 메모리 해제 로직
+     */
+    protected abstract void deallocate();
+}
+
+// PooledByteBuf.java
+@Override
+protected final void deallocate() {
+    if (handle >= 0) {
+        final long handle = this.handle;
+        this.handle = -1;
+        memory = null;
+
+        // ★ 풀로 반환!
+        chunk.arena.free(chunk, tmpNioBuf, handle, maxLength, cache);
+        tmpNioBuf = null;
+        chunk = null;
+        cache = null;
+
+        // ByteBuf 객체 자체도 재활용
+        recycle();
+    }
+}
+```
+
+---
+
+### 4.7.5 사용 패턴
+
+#### 기본 패턴
+
+```java
+ByteBuf buf = alloc.buffer(1024); // refCnt = 1
+try {
+    // 사용
+    buf.writeInt(42);
+    channel.write(buf); // 채널이 retain() 호출 (refCnt = 2)
+} finally {
+    buf.release(); // refCnt = 1 (채널이 여전히 보유)
+}
+
+// 채널이 전송 완료 후 release() → refCnt = 0 → 풀 반환
+```
+
+#### 전달 시 retain()
+
+```java
+public void processBuffer(ByteBuf buf) {
+    // 다른 스레드로 전달 → retain 필요!
+    ByteBuf retained = buf.retain(); // refCnt++
+
+    executorService.submit(() -> {
+        try {
+            // 비동기 처리
+            doSomething(retained);
+        } finally {
+            retained.release(); // refCnt--
+        }
+    });
+}
+```
+
+#### Derived Buffer (slice, duplicate)
+
+```java
+ByteBuf original = alloc.buffer(100); // refCnt = 1
+ByteBuf slice = original.slice(0, 50); // refCnt 공유!
+
+slice.release(); // refCnt = 0 → 원본도 해제됨!
+// original.readByte(); // IllegalReferenceCountException!
+
+// ★ 올바른 방법:
+ByteBuf original = alloc.buffer(100);
+ByteBuf slice = original.retainedSlice(0, 50); // refCnt = 2
+
+slice.release();        // refCnt = 1
+original.readByte();    // OK!
+original.release();     // refCnt = 0 → 해제
+```
+
+---
+
+### 4.7.6 메모리 누수 감지
+
+Netty는 **ResourceLeakDetector**로 누수를 자동 감지합니다:
+
+```java
+// ByteBufAllocator에서 자동 추적
+ByteBuf buf = alloc.buffer(1024);
+
+// release() 없이 GC되면 경고!
+buf = null;
+System.gc();
+
+// 로그:
+// LEAK: ByteBuf.release() was not called before it's garbage-collected.
+// Recent access records:
+// #1: io.netty.buffer.PooledByteBufAllocator.directBuffer(...)
+// #2: com.example.MyClass.allocateBuffer(MyClass.java:42)
+```
+
+**감지 레벨 설정**:
+
+```bash
+# DISABLED: 감지 안 함 (프로덕션)
+java -Dio.netty.leakDetection.level=DISABLED MyApp
+
+# SIMPLE: 1% 샘플링 (기본값)
+java -Dio.netty.leakDetection.level=SIMPLE MyApp
+
+# ADVANCED: 1% 샘플링 + 상세 로그
+java -Dio.netty.leakDetection.level=ADVANCED MyApp
+
+# PARANOID: 100% 추적 (개발/테스트)
+java -Dio.netty.leakDetection.level=PARANOID MyApp
+```
+
+---
+
+## 4.8 실전 가이드
+
+### 4.8.1 PooledByteBufAllocator 설정 권장사항
+
+#### 기본 설정 (대부분의 경우)
+
+```java
+// 글로벌 기본 Allocator 사용
+ByteBufAllocator alloc = PooledByteBufAllocator.DEFAULT;
+
+// Bootstrap에 적용
+ServerBootstrap b = new ServerBootstrap();
+b.childOption(ChannelOption.ALLOCATOR, PooledByteBufAllocator.DEFAULT);
+```
+
+**기본값이 이미 최적화되어 있음**:
+- Arena: CPU 코어 × 2
+- 페이지: 8KB
+- 청크: 4MB
+- 캐시: Small 256개, Normal 64개
+
+#### 고성능 서버 (많은 동시 연결)
+
+```bash
+# Arena 증가로 경합 감소
+java -Dio.netty.allocator.numDirectArenas=32 \
+     -Dio.netty.allocator.numHeapArenas=32 \
+     -Xmx4G \
+     -XX:MaxDirectMemorySize=2G \
+     MyServer
+```
+
+**트레이드오프**:
+- Arena 증가 → 경합 감소, 메모리 사용 증가
+- 32개 Arena × 3 Chunk × 4MB = 384MB 예상 사용
+
+#### 메모리 제약 환경 (임베디드, 컨테이너)
+
+```bash
+# 캐시 감소로 메모리 절약
+java -Dio.netty.allocator.smallCacheSize=128 \
+     -Dio.netty.allocator.normalCacheSize=32 \
+     -Dio.netty.allocator.maxCachedBufferCapacity=16384 \
+     -Xmx512M \
+     MyApp
+```
+
+**절약 예상**:
+- 스레드당 캐시: ~320KB (기본 640KB의 절반)
+- 100개 스레드: 32MB 절약
+
+#### 캐시 비활성화 (극단적 메모리 절약)
+
+```bash
+java -Dio.netty.allocator.useCacheForAllThreads=false \
+     -Dio.netty.allocator.smallCacheSize=0 \
+     -Dio.netty.allocator.normalCacheSize=0 \
+     MyApp
+```
+
+**주의**: 성능 약 50% 감소!
+
+---
+
+### 4.8.2 Direct vs Heap 선택 가이드
+
+#### 선택 플로우차트
+
+```
+할당 요청
+    │
+    ▼
+I/O 집약적? (네트워크/파일)
+    │
+    ├─ Yes → Direct Buffer 권장
+    │         ├─ 크기 > 64KB? → PooledDirectByteBuf
+    │         └─ 크기 < 64KB? → 성능 테스트 권장
+    │
+    └─ No → CPU 작업 위주?
+              │
+              ├─ Yes → Heap Buffer 권장
+              │         └─ 배열 접근 필요? → PooledHeapByteBuf
+              │
+              └─ 혼합 → 프로파일링 필요
+```
+
+#### 실제 사용 예시
+
+**웹 서버**:
+```java
+ServerBootstrap b = new ServerBootstrap();
+b.childOption(ChannelOption.ALLOCATOR, PooledByteBufAllocator.DEFAULT);
+// preferDirect = true (기본값) → Direct Buffer 사용
+```
+
+**데이터 처리 파이프라인**:
+```java
+public class DataProcessor extends ChannelInboundHandlerAdapter {
+    @Override
+    public void channelRead(ChannelHandlerContext ctx, Object msg) {
+        ByteBuf in = (ByteBuf) msg;
+
+        // CPU 작업 위주 → Heap으로 복사
+        if (in.isDirect()) {
+            ByteBuf heap = ctx.alloc().heapBuffer(in.readableBytes());
+            heap.writeBytes(in);
+            in.release();
+            in = heap;
+        }
+
+        // byte[] 배열 접근 가능
+        byte[] data = new byte[in.readableBytes()];
+        in.readBytes(data);
+        processData(data);
+
+        in.release();
+    }
+}
+```
+
+---
+
+### 4.8.3 Reference Counting 베스트 프랙티스
+
+#### DO: 명확한 소유권 관리
+
+```java
+✓ 올바른 패턴:
+public void handleRequest(ByteBuf request) {
+    try {
+        // 처리 로직
+        processRequest(request);
+    } finally {
+        // ★ 항상 finally에서 release
+        request.release();
+    }
+}
+```
+
+#### DON'T: 소유권 불명확
+
+```java
+✗ 잘못된 패턴:
+public void handleRequest(ByteBuf request) {
+    if (someCondition) {
+        request.release(); // 조건부 release
+        return;
+    }
+    processRequest(request);
+    // ★ 누락된 release! (메모리 누수)
+}
+```
+
+#### DO: 전달 시 retain
+
+```java
+✓ 비동기 처리:
+public void asyncProcess(ByteBuf buf) {
+    ByteBuf retained = buf.retain(); // refCnt++
+
+    CompletableFuture.runAsync(() -> {
+        try {
+            doWork(retained);
+        } finally {
+            retained.release(); // refCnt--
+        }
+    });
+}
+```
+
+#### DO: ReferenceCountUtil 활용
+
+```java
+import io.netty.util.ReferenceCountUtil;
+
+public void handleMessage(Object msg) {
+    try {
+        if (msg instanceof ByteBuf) {
+            ByteBuf buf = (ByteBuf) msg;
+            // 처리
+        }
+    } finally {
+        // ★ 모든 타입의 ReferenceCounted 객체 처리
+        ReferenceCountUtil.release(msg);
+    }
+}
+```
+
+---
+
+### 4.8.4 성능 모니터링
+
+#### PooledByteBufAllocator 메트릭
+
+```java
+PooledByteBufAllocatorMetric metric =
+    PooledByteBufAllocator.DEFAULT.metric();
+
+// Direct Arena 메트릭
+for (PoolArenaMetric arena : metric.directArenas()) {
+    System.out.println("Arena: " + arena);
+    System.out.println("  Allocations Normal: " + arena.numNormalAllocations());
+    System.out.println("  Allocations Small: " + arena.numSmallAllocations());
+    System.out.println("  Allocations Huge: " + arena.numHugeAllocations());
+    System.out.println("  Active Bytes: " + arena.numActiveBytes());
+    System.out.println("  Chunk Lists:");
+
+    for (PoolChunkListMetric chunkList : arena.chunkLists()) {
+        System.out.println("    " + chunkList);
+    }
+}
+
+// Thread Cache 개수
+System.out.println("Thread Caches: " + metric.numThreadLocalCaches());
+
+// 메모리 사용량
+System.out.println("Used Direct Memory: " + metric.usedDirectMemory());
+System.out.println("Used Heap Memory: " + metric.usedHeapMemory());
+```
+
+**출력 예시**:
+```
+Arena: PoolArena@1a2b3c4d
+  Allocations Normal: 15234
+  Allocations Small: 45123
+  Allocations Huge: 12
+  Active Bytes: 125829120
+  Chunk Lists:
+    qInit: 2 chunks
+    q000: 1 chunk
+    q025: 3 chunks
+    q050: 5 chunks
+    q075: 2 chunks
+    q100: 0 chunks
+Thread Caches: 128
+Used Direct Memory: 536870912 (512 MB)
+Used Heap Memory: 268435456 (256 MB)
+```
+
+---
+
+### 4.8.5 체크리스트
+
+**설정**:
+- [ ] PooledByteBufAllocator 사용 중? (UnpooledByteBufAllocator는 느림!)
+- [ ] Arena 개수가 CPU 코어 수에 적절한가?
+- [ ] Direct Memory 한계 설정? (`-XX:MaxDirectMemorySize`)
+- [ ] 메모리 제약 시 캐시 크기 조정?
+
+**사용**:
+- [ ] 모든 ByteBuf에 대해 release() 호출?
+- [ ] try-finally로 release 보장?
+- [ ] 비동기 전달 시 retain() 호출?
+- [ ] slice/duplicate 사용 시 retainedSlice/retainedDuplicate 고려?
+
+**모니터링**:
+- [ ] 메모리 누수 감지 활성화? (SIMPLE 이상)
+- [ ] 프로덕션에서 메트릭 수집?
+- [ ] Arena 사용률 모니터링?
+- [ ] Thread Cache 개수 추적?
+
+**성능**:
+- [ ] Direct Buffer를 I/O에 사용?
+- [ ] Heap Buffer를 CPU 작업에 사용?
+- [ ] CompositeByteBuf로 복사 최소화?
+- [ ] 프로파일링으로 병목 확인?
+
+---
+
+---
+
+## 5. 종합 및 실전 활용
+
+지금까지 배운 모든 개념을 통합하여 Netty의 고성능 아키텍처를 이해하고, 실전 프로젝트에 적용하는 방법을 알아봅니다.
+
+---
+
+### 5.1 Netty의 고성능 아키텍처 종합
+
+Netty는 지금까지 살펴본 네 가지 핵심 기술을 통합하여 고성능 네트워크 애플리케이션을 구현합니다:
+
+1. **Non-blocking I/O 모델** - Thread-per-connection 병목 제거
+2. **I/O 멀티플렉싱** - 단일 스레드로 수천 개 연결 처리
+3. **Zero-Copy 기술** - CPU 사이클 및 메모리 복사 최소화
+4. **Direct Buffer Pooling** - GC 압력 감소 및 메모리 재사용
+
+#### 5.1.1 전체 데이터 흐름
+
+다음은 클라이언트 요청이 Netty 서버를 통과하는 전체 흐름입니다:
+
+```
+[클라이언트]
+    |
+    | TCP 패킷
+    v
+[네트워크 카드 (NIC)]
+    |
+    | DMA 전송 (Zero-Copy #1)
+    v
+[커널 소켓 버퍼]
+    |
+    | epoll_wait() / kqueue() 감지
+    v
+[NioEventLoop 스레드]
+    |
+    | SocketChannel.read()
+    v
+[Direct ByteBuf (PooledDirectByteBuf)]
+    |  (Off-heap 메모리, GC 압력 없음)
+    |  (PoolThreadCache에서 Lock-free 할당)
+    |
+    | pipeline.fireChannelRead(byteBuf)
+    v
+[ChannelHandler #1]
+    |  HTTP Decoder
+    |  (Zero-Copy: slice()로 헤더 추출)
+    v
+[ChannelHandler #2]
+    |  비즈니스 로직
+    |  (CompositeByteBuf로 응답 조립)
+    v
+[ChannelHandler #3]
+    |  HTTP Encoder
+    v
+[ChannelOutboundBuffer]
+    |
+    | flush() 호출
+    v
+[NioEventLoop Write Loop]
+    |
+    | SocketChannel.write()
+    v
+[커널 소켓 버퍼]
+    |
+    | DMA 전송 (Zero-Copy #2)
+    v
+[네트워크 카드 (NIC)]
+    |
+    v
+[클라이언트]
+```
+
+**핵심 포인트**:
+- **단일 EventLoop 스레드**가 여러 채널의 read/write를 멀티플렉싱으로 처리
+- **Direct Buffer**로 JVM Heap과 네이티브 메모리 간 복사 최소화
+- **Zero-Copy 기법**으로 불필요한 메모리 복사 제거
+- **Pooling**으로 할당/해제 오버헤드 최소화
+
+#### 5.1.2 성능 향상 요인 분석
+
+| 기술 | 문제 해결 | 성능 향상 | 주요 메커니즘 |
+|------|----------|----------|-------------|
+| **Non-blocking I/O** | Thread-per-connection 스케일링 한계 | 10,000+ 동시 연결 처리 | 스레드를 블로킹하지 않고 이벤트 기반 처리 |
+| **I/O 멀티플렉싱 (epoll)** | select의 O(n) 스캔 | **11.9배** 처리량 향상 | O(1) ready list, edge-triggered 모드 |
+| **Zero-Copy (sendfile)** | 4번 메모리 복사 | **3.5배** 파일 전송 속도 | 커널 공간에서 직접 전송, DMA 활용 |
+| **CompositeByteBuf** | HTTP 헤더+바디 복사 | **12.8배** 처리량 향상 | Component 배열로 버퍼 조합 |
+| **Direct Buffer** | JNI 호출 시 임시 복사 | **1.64배** I/O 속도 | Off-heap 메모리 직접 접근 |
+| **PooledByteBufAllocator** | 매번 할당/해제 오버헤드 | **50배** 할당 속도 | jemalloc 설계, Arena + Buddy Allocation |
+| **PoolThreadCache** | Arena 락 경합 | **8.9배** 할당 속도 | 스레드별 Lock-free 캐시 |
+
+**종합 효과**: 전통적인 Blocking I/O + Heap Buffer 대비 **수십 배의 성능 향상** 달성.
+
+#### 5.1.3 Netty 고성능 핵심 원리
+
+##### 1) CPU 사이클 최소화
+
+```
+전통적인 방식:
+    컨텍스트 스위칭 (Thread-per-connection)
+    + 메모리 복사 4번 (read → user → write)
+    + GC 압력 (Heap 할당/해제)
+    = CPU 사용률 80%+
+
+Netty 방식:
+    이벤트 루프 (컨텍스트 스위칭 최소)
+    + Zero-Copy (복사 제거)
+    + Direct Buffer (GC 압력 제거)
+    = CPU 사용률 20-30%
+```
+
+##### 2) 메모리 효율성
+
+```
+전통적인 방식:
+    Thread 스택: 1MB × 10,000 = 10GB
+    + Heap 버퍼: 복사할 때마다 할당
+    + GC 오버헤드: Full GC 발생
+    = 메모리 부족, 응답 지연
+
+Netty 방식:
+    EventLoop 스레드: 1MB × CPU 코어 수 (예: 16MB)
+    + Direct Buffer Pool: 고정 크기 재사용
+    + Thread Cache: 95% 캐시 히트율
+    = 메모리 사용 안정, GC 영향 최소
+```
+
+##### 3) 레이턴시 감소
+
+```
+Blocking I/O:
+    P50: 10ms, P99: 500ms (스레드 대기 시간 포함)
+
+Netty (Non-blocking + epoll):
+    P50: 1ms, P99: 5ms (이벤트 루프 즉시 처리)
+```
+
+---
+
+### 5.2 성능 튜닝 가이드
+
+실전 프로젝트에서 Netty 성능을 최대한 끌어올리는 방법을 단계별로 안내합니다.
+
+#### 5.2.1 Transport 선택
+
+**플랫폼별 권장 Transport**:
+
+| 플랫폼 | 권장 Transport | 이유 |
+|--------|--------------|------|
+| **Linux** | Epoll | Native epoll, O(1) 성능, Edge-triggered 지원 |
+| **macOS/BSD** | KQueue | Native kqueue, Epoll과 유사한 성능 |
+| **Windows** | NIO | IOCP 미지원 시 NIO 사용 (차선책) |
+| **기타/테스트** | NIO | 범용 Java Selector, 플랫폼 독립적 |
+
+**코드 예시**:
+
+```java
+import io.netty.channel.EventLoopGroup;
+import io.netty.channel.ServerChannel;
+import io.netty.channel.epoll.Epoll;
+import io.netty.channel.epoll.EpollEventLoopGroup;
+import io.netty.channel.epoll.EpollServerSocketChannel;
+import io.netty.channel.kqueue.KQueue;
+import io.netty.channel.kqueue.KQueueEventLoopGroup;
+import io.netty.channel.kqueue.KQueueServerSocketChannel;
+import io.netty.channel.nio.NioEventLoopGroup;
+import io.netty.channel.socket.nio.NioServerSocketChannel;
+
+public class TransportSelector {
+
+    public static EventLoopGroup createBossGroup(int threads) {
+        if (Epoll.isAvailable()) {
+            System.out.println("Using Epoll (Linux native)");
+            return new EpollEventLoopGroup(threads);
+        } else if (KQueue.isAvailable()) {
+            System.out.println("Using KQueue (macOS/BSD native)");
+            return new KQueueEventLoopGroup(threads);
+        } else {
+            System.out.println("Using NIO (Java Selector)");
+            return new NioEventLoopGroup(threads);
+        }
+    }
+
+    public static Class<? extends ServerChannel> getServerChannelClass() {
+        if (Epoll.isAvailable()) {
+            return EpollServerSocketChannel.class;
+        } else if (KQueue.isAvailable()) {
+            return KQueueServerSocketChannel.class;
+        } else {
+            return NioServerSocketChannel.class;
+        }
+    }
+}
+
+// 사용 예시
+EventLoopGroup bossGroup = TransportSelector.createBossGroup(1);
+EventLoopGroup workerGroup = TransportSelector.createBossGroup(0); // CPU 코어 수 × 2
+
+ServerBootstrap b = new ServerBootstrap();
+b.group(bossGroup, workerGroup)
+ .channel(TransportSelector.getServerChannelClass())
+ // ... 기타 설정
+```
+
+**성능 차이**:
+- **Epoll vs NIO**: 약 **20-30% 처리량 향상**, 레이턴시 **50% 감소**
+- **Edge-triggered 모드**: 추가 **10-15% 향상** (이벤트 수 감소)
+
+#### 5.2.2 EventLoopGroup 크기 결정
+
+**BossGroup vs WorkerGroup**:
+
+```java
+// BossGroup: 연결 수락 담당
+// - 단일 포트당 1개 스레드 권장
+// - 다중 포트 바인딩 시 포트 수만큼
+EventLoopGroup bossGroup = new EpollEventLoopGroup(1);
+
+// WorkerGroup: I/O 처리 담당
+// - CPU 바운드: CPU 코어 수
+// - I/O 바운드: CPU 코어 수 × 2 (Netty 기본값)
+// - 매우 높은 동시성: CPU 코어 수 × 4
+int workerThreads = Runtime.getRuntime().availableProcessors() * 2;
+EventLoopGroup workerGroup = new EpollEventLoopGroup(workerThreads);
+```
+
+**워크로드별 가이드**:
+
+| 워크로드 유형 | WorkerGroup 크기 | 이유 |
+|-------------|-----------------|------|
+| CPU 집약적 (압축, 암호화) | CPU 코어 수 | 스레드 간 경합 최소화 |
+| I/O 집약적 (프록시, 게이트웨이) | CPU 코어 수 × 2 | I/O 대기 시 다른 작업 처리 |
+| 매우 높은 동시성 (C100K+) | CPU 코어 수 × 4 | 이벤트 루프 부하 분산 |
+| 짧은 연결 (HTTP) | CPU 코어 수 × 2 | 연결 수락 빈도 높음 |
+
+**주의사항**:
+- 스레드 수가 많다고 무조건 빠른 것은 아님 (컨텍스트 스위칭 오버헤드)
+- 프로파일링으로 CPU 사용률 확인 후 조정
+- 동일한 EventLoopGroup을 여러 서버가 공유 가능
+
+#### 5.2.3 ByteBuf Allocator 설정
+
+**PooledByteBufAllocator 튜닝**:
+
+```java
+import io.netty.buffer.PooledByteBufAllocator;
+import io.netty.channel.ChannelOption;
+
+ServerBootstrap b = new ServerBootstrap();
+b.group(bossGroup, workerGroup)
+ .channel(EpollServerSocketChannel.class)
+
+ // Pooled Direct Buffer 사용 (권장)
+ .option(ChannelOption.ALLOCATOR, PooledByteBufAllocator.DEFAULT)
+ .childOption(ChannelOption.ALLOCATOR, PooledByteBufAllocator.DEFAULT);
+```
+
+**커스텀 Allocator 생성**:
+
+```java
+// 메모리 제약이 있는 환경 (임베디드 등)
+PooledByteBufAllocator customAllocator = new PooledByteBufAllocator(
+    true,              // preferDirect: Direct Buffer 우선
+    2,                 // nHeapArena: Heap Arena 개수 (CPU 코어 수 기반)
+    2,                 // nDirectArena: Direct Arena 개수
+    8192,              // pageSize: 8KB (기본값)
+    11,                // maxOrder: 2^11 × 8KB = 16MB chunk
+    64,                // smallCacheSize: Small 캐시 크기
+    32,                // normalCacheSize: Normal 캐시 크기
+    true,              // useCacheForAllThreads
+    0                  // directMemoryCacheAlignment
+);
+
+b.option(ChannelOption.ALLOCATOR, customAllocator);
+```
+
+**JVM 옵션 설정**:
+
+```bash
+# Direct Memory 한계 설정
+java -XX:MaxDirectMemorySize=2G \
+     # Netty가 Unsafe 사용하도록 허용 (Java 9+)
+     --add-opens java.base/jdk.internal.misc=ALL-UNNAMED \
+     # 메모리 누수 감지 레벨
+     -Dio.netty.leakDetection.level=SIMPLE \
+     # Pooled Allocator 사용
+     -Dio.netty.allocator.type=pooled \
+     # Arena 개수 자동 조정 비활성화 (수동 설정 시)
+     -Dio.netty.allocator.numDirectArenas=4 \
+     YourApplication
+```
+
+#### 5.2.4 ChannelOption 튜닝
+
+**필수 옵션**:
+
+```java
+ServerBootstrap b = new ServerBootstrap();
+b.group(bossGroup, workerGroup)
+ .channel(EpollServerSocketChannel.class)
+
+ // === 서버 소켓 옵션 (option) ===
+
+ // 연결 대기열 크기
+ .option(ChannelOption.SO_BACKLOG, 1024)
+
+ // 주소 재사용 (빠른 재시작)
+ .option(ChannelOption.SO_REUSEADDR, true)
+
+ // === 클라이언트 소켓 옵션 (childOption) ===
+
+ // TCP Nagle 알고리즘 비활성화 (실시간 통신)
+ .childOption(ChannelOption.TCP_NODELAY, true)
+
+ // SO_KEEPALIVE 활성화 (긴 연결 유지)
+ .childOption(ChannelOption.SO_KEEPALIVE, true)
+
+ // 송신 버퍼 크기 (고대역폭 환경)
+ .childOption(ChannelOption.SO_SNDBUF, 256 * 1024) // 256KB
+
+ // 수신 버퍼 크기
+ .childOption(ChannelOption.SO_RCVBUF, 256 * 1024) // 256KB
+
+ // Write 버퍼 워터마크 (backpressure)
+ .childOption(ChannelOption.WRITE_BUFFER_WATER_MARK,
+     new WriteBufferWaterMark(32 * 1024, 64 * 1024))
+
+ // 자동 읽기 (기본: true)
+ .childOption(ChannelOption.AUTO_READ, true);
+```
+
+**옵션별 상세 설명**:
+
+| 옵션 | 기본값 | 권장값 | 설명 |
+|------|-------|-------|------|
+| `SO_BACKLOG` | 200 (Linux) | 1024-4096 | Accept queue 크기, 높은 동시 연결 시 증가 |
+| `TCP_NODELAY` | false | true | Nagle 비활성화, 실시간 통신 시 필수 |
+| `SO_KEEPALIVE` | false | true | 유휴 연결 감지, 긴 연결 서버에서 활성화 |
+| `SO_SNDBUF/SO_RCVBUF` | OS 기본 | 256KB+ | 고대역폭 환경에서 증가 (BDP 계산) |
+| `WRITE_BUFFER_WATER_MARK` | 32KB-64KB | 튜닝 필요 | Backpressure 임계값, 메모리 사용량 조절 |
+| `AUTO_READ` | true | true | false 시 수동으로 read() 호출 필요 |
+
+**Backpressure 설정 예시**:
+
+```java
+// 느린 클라이언트 대응: Write 버퍼가 High Water Mark 도달 시 읽기 중단
+.childOption(ChannelOption.WRITE_BUFFER_WATER_MARK,
+    new WriteBufferWaterMark(
+        32 * 1024,  // Low Water Mark: 32KB
+        64 * 1024   // High Water Mark: 64KB
+    ))
+
+// Handler에서 writability 확인
+public class BackpressureHandler extends ChannelInboundHandlerAdapter {
+    @Override
+    public void channelWritabilityChanged(ChannelHandlerContext ctx) {
+        if (ctx.channel().isWritable()) {
+            System.out.println("Channel writable again, resume reading");
+            ctx.channel().config().setAutoRead(true);
+        } else {
+            System.out.println("Channel not writable, pause reading");
+            ctx.channel().config().setAutoRead(false);
+        }
+    }
+}
+```
+
+#### 5.2.5 RecvByteBufAllocator 튜닝
+
+**AdaptiveRecvByteBufAllocator** (기본값):
+
+```java
+// 자동으로 수신 버퍼 크기 조정
+// - 작은 메시지: 64B부터 시작
+// - 큰 메시지: 최대 65536B까지 증가
+AdaptiveRecvByteBufAllocator allocator = new AdaptiveRecvByteBufAllocator(
+    64,        // minimum: 최소 버퍼 크기
+    1024,      // initial: 초기 버퍼 크기
+    65536      // maximum: 최대 버퍼 크기
+);
+
+b.childOption(ChannelOption.RCVBUF_ALLOCATOR, allocator);
+```
+
+**FixedRecvByteBufAllocator** (고정 크기 메시지):
+
+```java
+// 메시지 크기가 일정한 프로토콜 (예: 고정 길이 패킷)
+FixedRecvByteBufAllocator allocator = new FixedRecvByteBufAllocator(4096);
+b.childOption(ChannelOption.RCVBUF_ALLOCATOR, allocator);
+```
+
+#### 5.2.6 성능 튜닝 체크리스트
+
+**기본 설정**:
+- [ ] Epoll/KQueue Native Transport 사용 (Linux/macOS)
+- [ ] PooledByteBufAllocator 사용 (Unpooled는 느림!)
+- [ ] Direct Buffer 우선 사용 (I/O 성능)
+- [ ] EventLoopGroup 크기 최적화 (CPU 코어 수 × 2)
+
+**네트워크 설정**:
+- [ ] `TCP_NODELAY=true` (실시간 통신)
+- [ ] `SO_KEEPALIVE=true` (긴 연결 유지)
+- [ ] `SO_BACKLOG` 충분히 설정 (1024+)
+- [ ] `SO_SNDBUF/SO_RCVBUF` 고대역폭 환경에서 증가
+
+**메모리 설정**:
+- [ ] `-XX:MaxDirectMemorySize` 설정 (2GB+)
+- [ ] Arena 개수 적절히 설정 (기본값 또는 수동)
+- [ ] Thread Cache 크기 조정 (메모리 제약 시)
+- [ ] 메모리 누수 감지 활성화 (`-Dio.netty.leakDetection.level=SIMPLE`)
+
+**코드 최적화**:
+- [ ] Zero-Copy 기법 활용 (slice, CompositeByteBuf)
+- [ ] 모든 ByteBuf에 대해 release() 호출
+- [ ] FileRegion으로 파일 전송 (sendfile)
+- [ ] Backpressure 처리 (WRITE_BUFFER_WATER_MARK)
+
+**모니터링**:
+- [ ] PooledByteBufAllocator 메트릭 수집
+- [ ] EventLoop 큐 길이 모니터링
+- [ ] GC 로그 분석 (Direct Buffer GC 영향 확인)
+- [ ] CPU 및 네트워크 사용률 추적
+
+---
+
+### 5.3 모니터링 및 프로파일링
+
+프로덕션 환경에서 Netty 애플리케이션의 성능을 추적하고 병목을 찾는 방법입니다.
+
+#### 5.3.1 PooledByteBufAllocator 메트릭
+
+**실시간 메트릭 수집**:
+
+```java
+import io.netty.buffer.PooledByteBufAllocatorMetric;
+import io.netty.buffer.PoolArenaMetric;
+
+public class AllocatorMonitor {
+
+    private final PooledByteBufAllocator allocator;
+
+    public AllocatorMonitor(PooledByteBufAllocator allocator) {
+        this.allocator = allocator;
+    }
+
+    public void printMetrics() {
+        PooledByteBufAllocatorMetric metric = allocator.metric();
+
+        System.out.println("=== ByteBuf Allocator Metrics ===");
+        System.out.println("Used Direct Memory: " +
+            formatBytes(metric.usedDirectMemory()));
+        System.out.println("Used Heap Memory: " +
+            formatBytes(metric.usedHeapMemory()));
+        System.out.println("Thread Local Caches: " +
+            metric.numThreadLocalCaches());
+
+        // Direct Arenas
+        System.out.println("\n--- Direct Arenas ---");
+        for (PoolArenaMetric arena : metric.directArenas()) {
+            printArenaMetrics(arena);
+        }
+
+        // Heap Arenas
+        System.out.println("\n--- Heap Arenas ---");
+        for (PoolArenaMetric arena : metric.heapArenas()) {
+            printArenaMetrics(arena);
+        }
+    }
+
+    private void printArenaMetrics(PoolArenaMetric arena) {
+        System.out.println("Arena: " + arena);
+        System.out.println("  Allocations Normal: " + arena.numNormalAllocations());
+        System.out.println("  Allocations Small: " + arena.numSmallAllocations());
+        System.out.println("  Allocations Huge: " + arena.numHugeAllocations());
+        System.out.println("  Deallocations Normal: " + arena.numNormalDeallocations());
+        System.out.println("  Deallocations Small: " + arena.numSmallDeallocations());
+        System.out.println("  Deallocations Huge: " + arena.numHugeDeallocations());
+        System.out.println("  Active Bytes: " + formatBytes(arena.numActiveBytes()));
+        System.out.println("  Active Allocations: " + arena.numActiveAllocations());
+
+        // Chunk Lists
+        System.out.println("  Chunk Lists:");
+        arena.chunkLists().forEach(chunkList -> {
+            System.out.println("    " + chunkList);
+        });
+    }
+
+    private String formatBytes(long bytes) {
+        if (bytes < 1024) return bytes + " B";
+        if (bytes < 1024 * 1024) return (bytes / 1024) + " KB";
+        if (bytes < 1024 * 1024 * 1024) return (bytes / (1024 * 1024)) + " MB";
+        return (bytes / (1024 * 1024 * 1024)) + " GB";
+    }
+
+    // 주기적 모니터링
+    public void startMonitoring(long intervalMs) {
+        ScheduledExecutorService scheduler = Executors.newScheduledThreadPool(1);
+        scheduler.scheduleAtFixedRate(
+            this::printMetrics,
+            0,
+            intervalMs,
+            TimeUnit.MILLISECONDS
+        );
+    }
+}
+
+// 사용 예시
+AllocatorMonitor monitor = new AllocatorMonitor(PooledByteBufAllocator.DEFAULT);
+monitor.startMonitoring(10000); // 10초마다 출력
+```
+
+**주요 지표 해석**:
+
+| 지표 | 정상 범위 | 문제 징후 |
+|------|----------|----------|
+| `usedDirectMemory` | 안정적 | 계속 증가 → 메모리 누수 |
+| `numThreadLocalCaches` | 스레드 수와 비슷 | 너무 많음 → 불필요한 스레드 생성 |
+| `numActiveAllocations` | 일정 범위 | 계속 증가 → ByteBuf release 누락 |
+| `numHugeAllocations` | 거의 0 | 많음 → 큰 버퍼 할당, 풀링 효과 없음 |
+| Chunk List 분포 | q050-q075 중심 | q100 많음 → 메모리 파편화 |
+
+#### 5.3.2 EventLoop 모니터링
+
+**EventLoop 큐 길이 추적**:
+
+```java
+import io.netty.util.concurrent.SingleThreadEventExecutor;
+
+public class EventLoopMonitor {
+
+    public static void monitorEventLoop(EventLoop eventLoop) {
+        // EventLoop가 SingleThreadEventExecutor인 경우
+        if (eventLoop instanceof SingleThreadEventExecutor) {
+            SingleThreadEventExecutor executor = (SingleThreadEventExecutor) eventLoop;
+
+            // 대기 중인 작업 수
+            int pendingTasks = executor.pendingTasks();
+            System.out.println("Pending Tasks: " + pendingTasks);
+
+            // 경고: 큐가 계속 차오르면 병목
+            if (pendingTasks > 1000) {
+                System.err.println("WARNING: EventLoop queue is growing! " +
+                                   "Consider adding more worker threads.");
+            }
+        }
+    }
+
+    // 모든 EventLoop 모니터링
+    public static void monitorEventLoopGroup(EventLoopGroup group) {
+        group.forEach(eventLoop -> {
+            System.out.println("EventLoop: " + eventLoop);
+            monitorEventLoop((EventLoop) eventLoop);
+        });
+    }
+}
+
+// 주기적 모니터링
+ScheduledExecutorService scheduler = Executors.newScheduledThreadPool(1);
+scheduler.scheduleAtFixedRate(() -> {
+    EventLoopMonitor.monitorEventLoopGroup(workerGroup);
+}, 0, 5, TimeUnit.SECONDS);
+```
+
+#### 5.3.3 메모리 누수 감지
+
+**ResourceLeakDetector 레벨 설정**:
+
+```bash
+# 레벨 0 (DISABLED): 감지 비활성화 (프로덕션)
+java -Dio.netty.leakDetection.level=DISABLED YourApp
+
+# 레벨 1 (SIMPLE): 1% 샘플링, 누수 여부만 보고
+java -Dio.netty.leakDetection.level=SIMPLE YourApp
+
+# 레벨 2 (ADVANCED): 1% 샘플링, 누수 위치 추적
+java -Dio.netty.leakDetection.level=ADVANCED YourApp
+
+# 레벨 3 (PARANOID): 100% 추적, 매우 느림 (디버깅 전용)
+java -Dio.netty.leakDetection.level=PARANOID YourApp
+```
+
+**누수 발견 시 로그 예시**:
+
+```
+ERROR io.netty.util.ResourceLeakDetector - LEAK: ByteBuf.release() was not called before it's garbage-collected.
+Recent access records:
+#1:
+    io.netty.buffer.AdvancedLeakAwareByteBuf.writeBytes(AdvancedLeakAwareByteBuf.java:147)
+    com.example.MyHandler.channelRead(MyHandler.java:42)
+    io.netty.channel.AbstractChannelHandlerContext.invokeChannelRead(AbstractChannelHandlerContext.java:379)
+    ...
+```
+
+**누수 수정**:
+
+```java
+// 잘못된 코드 (누수 발생)
+@Override
+public void channelRead(ChannelHandlerContext ctx, Object msg) {
+    ByteBuf buf = (ByteBuf) msg;
+    // buf.release() 호출 안 함! → 메모리 누수
+    processData(buf);
+}
+
+// 올바른 코드
+@Override
+public void channelRead(ChannelHandlerContext ctx, Object msg) {
+    ByteBuf buf = (ByteBuf) msg;
+    try {
+        processData(buf);
+    } finally {
+        buf.release(); // 반드시 release!
+    }
+}
+
+// 더 나은 방법: SimpleChannelInboundHandler 사용
+public class MyHandler extends SimpleChannelInboundHandler<ByteBuf> {
+    @Override
+    protected void channelRead0(ChannelHandlerContext ctx, ByteBuf msg) {
+        // msg는 자동으로 release됨!
+        processData(msg);
+    }
+}
+```
+
+#### 5.3.4 GC 로그 분석
+
+**GC 로그 활성화**:
+
+```bash
+# Java 8
+java -XX:+PrintGCDetails \
+     -XX:+PrintGCTimeStamps \
+     -Xloggc:gc.log \
+     YourApp
+
+# Java 11+
+java -Xlog:gc*:file=gc.log:time,uptime,level,tags \
+     YourApp
+```
+
+**Direct Buffer GC 확인**:
+
+Direct Buffer는 `Full GC` 또는 `System.gc()` 호출 시에만 정리됩니다. GC 로그에서 다음을 확인:
+
+- `Full GC` 빈도: 1시간에 1번 이하가 정상
+- Old Generation 사용률: 안정적이어야 함
+- Direct Buffer 증가 후 Full GC 발생 여부
+
+```
+# 정상 패턴
+[GC (Allocation Failure) ... 200MB->50MB(512MB), 0.01 secs]
+[GC (Allocation Failure) ... 200MB->50MB(512MB), 0.01 secs]
+...
+
+# 문제 패턴 (Direct Buffer 누수)
+[GC (Allocation Failure) ... 200MB->50MB(512MB), 0.01 secs]
+[Full GC (System.gc()) ... 512MB->512MB(1GB), 2.5 secs] ← MaxDirectMemorySize 초과로 Full GC
+[Full GC (System.gc()) ... 512MB->512MB(1GB), 2.5 secs]
+```
+
+#### 5.3.5 프로파일링 도구
+
+**Java Flight Recorder (JFR)** (권장):
+
+```bash
+# JFR 활성화하여 실행
+java -XX:+FlightRecorder \
+     -XX:StartFlightRecording=duration=60s,filename=recording.jfr \
+     YourApp
+
+# JFR 파일 분석 (JDK Mission Control 사용)
+jmc recording.jfr
+```
+
+**JFR에서 확인할 사항**:
+- **Socket I/O**: 읽기/쓰기 시간 및 빈도
+- **Object Allocation**: ByteBuf 할당 패턴
+- **Thread Activity**: EventLoop 스레드 CPU 사용률
+- **GC Activity**: Young/Old GC 빈도 및 시간
+
+**Async Profiler** (CPU 및 메모리):
+
+```bash
+# CPU 프로파일링
+./profiler.sh -d 30 -f flamegraph.html <PID>
+
+# 메모리 할당 프로파일링
+./profiler.sh -d 30 -e alloc -f alloc-flamegraph.html <PID>
+```
+
+---
+
+### 5.4 참고 자료
+
+Netty 및 네트워크 프로그래밍을 깊이 이해하기 위한 참고 자료입니다.
+
+#### 5.4.1 논문 및 학술 자료
+
+**I/O 멀티플렉싱**:
+- **"The C10K Problem"** - Dan Kegel
+  http://www.kegel.com/c10k.html
+  고성능 네트워크 서버 설계의 고전적 문서.
+
+- **"scalable network I/O in Linux"** - Davide Libenzi (epoll 저자)
+  https://www.kernel.org/doc/ols/2004/ols2004v1-pages-329-340.pdf
+  Linux epoll의 설계 및 구현 상세 설명.
+
+**메모리 관리**:
+- **"A Scalable Concurrent malloc(3) Implementation for FreeBSD"** - Jason Evans (jemalloc)
+  https://people.freebsd.org/~jasone/jemalloc/bsdcan2006/jemalloc.pdf
+  jemalloc 설계 원리 (Netty의 PoolArena 기반).
+
+- **"Buddy System"** - Donald Knuth
+  The Art of Computer Programming, Volume 1
+  Buddy Allocation 알고리즘 원본.
+
+**Zero-Copy**:
+- **"sendfile() System Call"** - Linux Man Pages
+  https://man7.org/linux/man-pages/man2/sendfile.2.html
+  sendfile 시스템 콜 공식 문서.
+
+#### 5.4.2 Netty 공식 문서
+
+- **Netty 프로젝트 홈페이지**:
+  https://netty.io/
+
+- **Netty User Guide**:
+  https://netty.io/wiki/user-guide-for-4.x.html
+  Netty 4.x 사용자 가이드.
+
+- **Netty API Documentation**:
+  https://netty.io/4.1/api/index.html
+  전체 API 레퍼런스.
+
+- **Netty GitHub Repository**:
+  https://github.com/netty/netty
+  소스 코드 및 이슈 트래커.
+
+#### 5.4.3 OS별 시스템 콜 문서
+
+**Linux**:
+- epoll: https://man7.org/linux/man-pages/man7/epoll.7.html
+- sendfile: https://man7.org/linux/man-pages/man2/sendfile.2.html
+- splice: https://man7.org/linux/man-pages/man2/splice.2.html
+
+**macOS/BSD**:
+- kqueue: https://www.freebsd.org/cgi/man.cgi?query=kqueue
+- kevent: https://www.freebsd.org/cgi/man.cgi?query=kevent
+
+**POSIX**:
+- select: https://pubs.opengroup.org/onlinepubs/9699919799/functions/select.html
+- fcntl: https://pubs.opengroup.org/onlinepubs/9699919799/functions/fcntl.html
+
+#### 5.4.4 블로그 및 기술 아티클
+
+- **Norman Maurer (Netty 리드 개발자) 블로그**:
+  https://normanmaurer.me/
+  Netty 내부 구조 및 최적화 기법.
+
+- **Trustin Lee (Netty 창시자) 발표 자료**:
+  https://www.slideshare.net/trustin/
+  Netty 설계 철학 및 성능 분석.
+
+- **Netty in Action** (책):
+  Norman Maurer, Marvin Allen Wolfthal
+  Netty 실전 활용서.
+
+#### 5.4.5 벤치마크 및 성능 분석
+
+- **TechEmpower Framework Benchmarks**:
+  https://www.techempower.com/benchmarks/
+  다양한 프레임워크 성능 비교 (Netty 포함).
+
+- **Netty Performance Tests**:
+  https://github.com/netty/netty/tree/4.1/microbench
+  Netty 공식 마이크로벤치마크.
+
+---
+
+## 6. 결론
+
+이 가이드에서는 Netty가 **어떻게 고성능을 달성하는지**를 네 가지 핵심 기술을 통해 상세히 분석했습니다:
+
+### 6.1 핵심 개념 요약
+
+1. **Non-blocking I/O 모델**:
+   - Thread-per-connection의 스케일링 한계 극복
+   - 이벤트 기반 아키텍처로 수만 개의 동시 연결 처리
+   - Netty의 `NioSocketChannel`과 `AbstractNioByteChannel`로 구현
+
+2. **I/O 멀티플렉싱** (select → epoll/kqueue):
+   - 단일 스레드가 여러 소켓을 동시에 모니터링
+   - epoll의 O(1) 성능으로 **11.9배** 처리량 향상
+   - Netty의 `NioIoHandler`가 Selector를 최적화하여 사용
+
+3. **Zero-Copy 기술**:
+   - CPU 사이클 및 메모리 복사 최소화
+   - sendfile()로 **3.5배** 파일 전송 속도 향상
+   - CompositeByteBuf로 **12.8배** 버퍼 조립 성능 향상
+   - Netty의 `DefaultFileRegion`, `CompositeByteBuf`, slice/duplicate 구현
+
+4. **Direct Buffer 및 메모리 최적화**:
+   - Off-heap 메모리로 JNI 호출 시 복사 제거
+   - jemalloc 기반 `PooledByteBufAllocator`로 **50배** 할당 속도 향상
+   - Arena + Buddy Allocation으로 파편화 최소화
+   - PoolThreadCache로 **8.9배** Lock-free 할당 성능 향상
+   - Reference Counting으로 명시적 메모리 관리
+
+### 6.2 종합 효과
+
+이 네 가지 기술을 통합하면:
+
+```
+전통적인 Blocking I/O + Heap Buffer:
+    - 동시 연결: 수백 개 (스레드 한계)
+    - 처리량: 10,000 req/sec
+    - 레이턴시: P99 500ms
+    - CPU 사용률: 80%+
+    - 메모리: 10GB (스레드 스택)
+
+Netty (Non-blocking + epoll + Zero-Copy + Pooling):
+    - 동시 연결: 100,000+ 개
+    - 처리량: 200,000+ req/sec (20배 향상)
+    - 레이턴시: P99 5ms (100배 향상)
+    - CPU 사용률: 20-30% (3배 감소)
+    - 메모리: 1GB 이하 (10배 감소)
+```
+
+### 6.3 실전 적용 시 핵심 체크포인트
+
+프로덕션 환경에서 Netty를 사용할 때:
+
+**필수 설정**:
+- ✅ Epoll/KQueue Native Transport 사용 (Linux/macOS)
+- ✅ PooledByteBufAllocator 사용
+- ✅ Direct Buffer 우선
+- ✅ 모든 ByteBuf에 대해 release() 호출
+
+**성능 튜닝**:
+- ✅ EventLoopGroup 크기: CPU 코어 수 × 2
+- ✅ TCP_NODELAY, SO_KEEPALIVE 활성화
+- ✅ SO_BACKLOG, SO_SNDBUF/RCVBUF 조정
+- ✅ Zero-Copy 기법 적극 활용
+
+**모니터링**:
+- ✅ PooledByteBufAllocator 메트릭 수집
+- ✅ EventLoop 큐 길이 추적
+- ✅ 메모리 누수 감지 (SIMPLE 레벨)
+- ✅ GC 로그 분석
+
+### 6.4 마치며
+
+Netty는 단순한 네트워크 라이브러리가 아닌, **OS 레벨부터 애플리케이션 레벨까지 네트워크 스택 전체를 최적화한 프레임워크**입니다. 이 가이드를 통해:
+
+- **이론적 배경**: 왜 이러한 기술이 필요한지 이해
+- **OS/JVM 구현**: 실제로 어떻게 동작하는지 파악
+- **Netty 코드 분석**: Netty가 어떻게 구현했는지 학습
+- **실전 활용**: 프로젝트에 적용 가능한 지식 획득
+
+이제 여러분은 Netty의 고성능 메커니즘을 깊이 이해하고, 실전 프로젝트에서 최대 성능을 끌어낼 수 있는 역량을 갖추셨습니다.
+
+**Happy Nettying! 🚀**
+
+---
+
+*이 문서는 Netty 4.1 기준으로 작성되었습니다.*
+*최신 정보는 [Netty 공식 문서](https://netty.io/)를 참고하세요.*
+
